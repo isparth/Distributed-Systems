@@ -38,13 +38,13 @@ func (store *KVStore) Delete(key string) bool {
 	return true
 }
 
-func (store *KVStore) CAS(key string, new string, expected string) bool {
+func (store *KVStore) CAS(key string, value string, expected string) bool {
 	store.mu.Lock()
 	defer store.mu.Unlock()
-	value, _ := store.data[key]
+	val, _ := store.data[key]
 
-	if value == expected {
-		store.data[key] = new
+	if val == expected {
+		store.data[key] = value
 		return true
 	}
 

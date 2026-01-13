@@ -6,8 +6,11 @@ import (
 )
 
 func registerRoutes(r chi.Router, kv *kv.KVStore) {
-	r.Route("/v1", func(r chi.Router) {
+	r.Route("/kv", func(r chi.Router) {
 		r.Get("/healthz", handleHealthz(kv))
+		r.Get("/{key}", handleGet(kv))
+		r.Put("/{key}", handlePut(kv))
+		r.Delete("/{key}", handleDelete(kv))
 
 	})
 }
