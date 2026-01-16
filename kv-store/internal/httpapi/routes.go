@@ -7,10 +7,13 @@ import (
 
 func registerRoutes(r chi.Router, kv *kv.KVStore) {
 	r.Route("/kv", func(r chi.Router) {
-		r.Get("/healthz", handleHealthz(kv))
+		r.Get("/healthz", handleHealthz())
 		r.Get("/{key}", handleGet(kv))
 		r.Put("/{key}", handlePut(kv))
 		r.Delete("/{key}", handleDelete(kv))
+		r.Post("/mget", handleMGet(kv))
+		r.Put("/mput", handleMPut(kv))
+		r.Post("/mdelete", handleMDelete(kv))
 
 	})
 }

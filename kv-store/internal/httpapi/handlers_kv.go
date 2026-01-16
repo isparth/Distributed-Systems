@@ -10,7 +10,7 @@ import (
 	"github.com/isparth/Distributed-Systems/kv-store/internal/kv"
 )
 
-func handleHealthz(kv *kv.KVStore) http.HandlerFunc {
+func handleHealthz() http.HandlerFunc {
 	type resp struct {
 		Status string `json:"status"`
 		Time   string `json:"time"`
@@ -24,7 +24,7 @@ func handleHealthz(kv *kv.KVStore) http.HandlerFunc {
 	}
 }
 
-func handleGet(kv *kv.KVStore) http.HandlerFunc {
+func handleGet(store *kv.KVStore) http.HandlerFunc {
 	type resp struct {
 		Value string `json:"value"`
 		Ok    bool   `json:"ok"`
@@ -36,7 +36,7 @@ func handleGet(kv *kv.KVStore) http.HandlerFunc {
 			http.Error(w, "Key is Missing", http.StatusBadRequest)
 			return
 		}
-		value, ok := kv.Get(key)
+		value, ok := store.Get(key)
 		respond.JSON(w, http.StatusOK, resp{
 			Value: value,
 			Ok:    ok,
@@ -44,7 +44,7 @@ func handleGet(kv *kv.KVStore) http.HandlerFunc {
 	}
 }
 
-func handlePut(kv *kv.KVStore) http.HandlerFunc {
+func handlePut(store *kv.KVStore) http.HandlerFunc {
 	type resp struct {
 		Ok bool `json:"ok"`
 	}
@@ -63,22 +63,24 @@ func handlePut(kv *kv.KVStore) http.HandlerFunc {
 
 		var req PutRequest
 
-		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		decoder := json.NewDecoder(r.Body)
+		if err := decoder.Decode(&req); err != nil {
 			http.Error(w, "invalid json", http.StatusBadRequest)
 			return
 		}
 
 		if req.Value == nil {
 			http.Error(w, "Value is Missing", http.StatusBadRequest)
+			return
 		}
 
 		var ok bool
 
 		if req.Expected != nil {
-			ok = kv.CAS(key, *req.Value, *req.Expected)
+			ok = store.CAS(key, *req.Value, *req.Expected)
 
 		} else {
-			ok = kv.Put(key, *req.Value)
+			ok = store.Put(kv.Entry{Key: key, Value: *req.Value})
 		}
 
 		respond.JSON(w, http.StatusOK, resp{
@@ -87,7 +89,7 @@ func handlePut(kv *kv.KVStore) http.HandlerFunc {
 	}
 }
 
-func handleDelete(kv *kv.KVStore) http.HandlerFunc {
+func handleDelete(store *kv.KVStore) http.HandlerFunc {
 	type resp struct {
 		Ok bool `json:"ok"`
 	}
@@ -100,10 +102,91 @@ func handleDelete(kv *kv.KVStore) http.HandlerFunc {
 			return
 		}
 
-		ok := kv.Delete(key)
+		ok := store.Delete(key)
 		respond.JSON(w, http.StatusOK, resp{
 
 			Ok: ok,
+		})
+	}
+}
+
+func handleMGet(store *kv.KVStore) http.HandlerFunc {
+	type reqBody struct {
+		Keys []string `json:"keys"`
+	}
+	type resp struct {
+		Values map[string]string `json:"values"`
+	}
+
+	return func(w http.ResponseWriter, r *http.Request) {
+		var req reqBody
+		decoder := json.NewDecoder(r.Body)
+		if err := decoder.Decode(&req); err != nil {
+			http.Error(w, "invalid json", http.StatusBadRequest)
+			return
+		}
+		if len(req.Keys) == 0 {
+			http.Error(w, "Keys are Missing", http.StatusBadRequest)
+			return
+		}
+
+		values := store.MGet(req.Keys)
+		respond.JSON(w, http.StatusOK, resp{
+			Values: values,
+		})
+	}
+}
+
+func handleMPut(store *kv.KVStore) http.HandlerFunc {
+	type reqBody struct {
+		Entries []kv.Entry `json:"entries"`
+	}
+	type resp struct {
+		Ok bool `json:"ok"`
+	}
+
+	return func(w http.ResponseWriter, r *http.Request) {
+		var req reqBody
+		decoder := json.NewDecoder(r.Body)
+		if err := decoder.Decode(&req); err != nil {
+			http.Error(w, "invalid json", http.StatusBadRequest)
+			return
+		}
+		if len(req.Entries) == 0 {
+			http.Error(w, "Entries are Missing", http.StatusBadRequest)
+			return
+		}
+
+		ok := store.MPut(req.Entries)
+		respond.JSON(w, http.StatusOK, resp{
+			Ok: ok,
+		})
+	}
+}
+
+func handleMDelete(store *kv.KVStore) http.HandlerFunc {
+	type reqBody struct {
+		Keys []string `json:"keys"`
+	}
+	type resp struct {
+		Deleted int `json:"deleted"`
+	}
+
+	return func(w http.ResponseWriter, r *http.Request) {
+		var req reqBody
+		decoder := json.NewDecoder(r.Body)
+		if err := decoder.Decode(&req); err != nil {
+			http.Error(w, "invalid json", http.StatusBadRequest)
+			return
+		}
+		if len(req.Keys) == 0 {
+			http.Error(w, "Keys are Missing", http.StatusBadRequest)
+			return
+		}
+
+		count := store.MDelete(req.Keys)
+		respond.JSON(w, http.StatusOK, resp{
+			Deleted: count,
 		})
 	}
 }
