@@ -8,7 +8,7 @@ import (
 )
 
 func main() {
-	kv := kv.NewKVStore(kv.NoPersistence)
+	kv := kv.NewKVStore(kv.StrongWAL)
 
 	handler := httpapi.NewRouter(kv)
 

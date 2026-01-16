@@ -66,9 +66,9 @@ func defaultSnapshotRules() []SnapshotRule {
 }
 
 type KVStore struct {
-	mu   sync.Mutex
-	data map[string]string
-	mode DurabilityMode
+	mu      sync.Mutex
+	data    map[string]string
+	mode    DurabilityMode
 	stopped bool
 
 	// snapshot fields
@@ -273,7 +273,6 @@ func (store *KVStore) appendToWALAsync(rec walRecord) (ok bool) {
 	case ch <- rec:
 		return true
 	default:
-		// queue full: choose backpressure vs drop
 		return false
 	}
 }
@@ -311,6 +310,7 @@ func (store *KVStore) Stop() bool {
 	return true
 }
 
+// Restart Operation it
 func (store *KVStore) Restart() bool {
 	if !store.Stop() {
 		return false
@@ -388,6 +388,7 @@ func (store *KVStore) MGet(keys []string) map[string]string {
 	return out
 }
 
+// Put Operation
 func (store *KVStore) Put(kv Entry) bool {
 	if kv.Key == "" {
 		return false
@@ -442,6 +443,7 @@ func (store *KVStore) Put(kv Entry) bool {
 	}
 }
 
+// Multiple Put Operation
 func (store *KVStore) MPut(kvs []Entry) bool {
 	for _, kv := range kvs {
 		if kv.Key == "" {
@@ -506,6 +508,7 @@ func (store *KVStore) MPut(kvs []Entry) bool {
 	}
 }
 
+// Delete Operation
 func (store *KVStore) Delete(key string) bool {
 	if key == "" {
 		return false
@@ -563,8 +566,9 @@ func (store *KVStore) Delete(key string) bool {
 	}
 }
 
+// Multiple detele Operation
 func (store *KVStore) MDelete(keys []string) int {
-	// Redis-style: ignore empty keys / missing keys; count actual deletions
+
 	switch store.mode {
 	case SnapshotOnly:
 		store.mu.Lock()
@@ -659,6 +663,7 @@ func (store *KVStore) MDelete(keys []string) int {
 	}
 }
 
+// CAS Operation
 func (store *KVStore) CAS(key, value, expected string) bool {
 	if key == "" {
 		return false

@@ -6,6 +6,8 @@ import (
 )
 
 func registerRoutes(r chi.Router, kv *kv.KVStore) {
+	r.Get("/", handleUI())
+	r.Get("/ui", handleUI())
 	r.Route("/kv", func(r chi.Router) {
 		r.Get("/healthz", handleHealthz())
 		r.Post("/stop", handleStop(kv))
