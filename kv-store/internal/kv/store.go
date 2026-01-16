@@ -2,6 +2,7 @@ package kv
 
 import (
 	"encoding/gob"
+	"io"
 	"os"
 	"sync"
 	"time"
@@ -29,6 +30,8 @@ const (
 const (
 	defaultSnapshotEverySeconds = 30
 	defaultSnapshotMinChanges   = 100
+	walFileName                 = "wal.log"
+	snapshotFileName            = "snapshot.gob"
 )
 
 type walOp uint8
@@ -55,10 +58,18 @@ type walRecord struct {
 	Expected string
 }
 
+func defaultSnapshotRules() []SnapshotRule {
+	return []SnapshotRule{{
+		EverySeconds: defaultSnapshotEverySeconds,
+		MinChanges:   defaultSnapshotMinChanges,
+	}}
+}
+
 type KVStore struct {
 	mu   sync.Mutex
 	data map[string]string
 	mode DurabilityMode
+	stopped bool
 
 	// snapshot fields
 	snapshotRules    []SnapshotRule
@@ -67,6 +78,7 @@ type KVStore struct {
 
 	// Write ahead log fields.
 	walCh      chan walRecord
+	walDone    chan struct{}
 	walEncoder *gob.Encoder
 	walFile    *os.File
 }
@@ -76,33 +88,45 @@ func NewKVStore(mode DurabilityMode) *KVStore {
 	store := &KVStore{data: make(map[string]string), mode: mode}
 
 	if mode == SnapshotOnly {
-		store.snapshotRules = []SnapshotRule{{
-			EverySeconds: defaultSnapshotEverySeconds,
-			MinChanges:   defaultSnapshotMinChanges,
-		}}
+		store.snapshotRules = defaultSnapshotRules()
 		store.lastSnapshot = time.Now()
 	}
 
 	// Creates a Write Ahead
 	if mode == StrongWAL || mode == FastWAL {
-		f, err := os.OpenFile("wal.log", os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
-		if err != nil {
+		if err := store.initWAL(); err != nil {
 			return store
 		}
-		store.walFile = f
-		store.walEncoder = gob.NewEncoder(f)
 	}
 
-	if mode == FastWAL {
+	return store
+}
+
+func (store *KVStore) initWAL() error {
+	f, err := os.OpenFile(walFileName, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		return err
+	}
+	store.walFile = f
+	store.walEncoder = gob.NewEncoder(f)
+	store.walCh = nil
+	store.walDone = nil
+
+	if store.mode == FastWAL {
 		store.walCh = make(chan walRecord, 1024)
+		store.walDone = make(chan struct{})
+		enc := store.walEncoder
+		ch := store.walCh
+		done := store.walDone
 		go func() {
-			for rec := range store.walCh {
-				_ = store.walEncoder.Encode(rec)
+			defer close(done)
+			for rec := range ch {
+				_ = enc.Encode(rec)
 			}
 		}()
 	}
 
-	return store
+	return nil
 }
 
 func (store *KVStore) maybeSnapshot(rules []SnapshotRule) {
@@ -113,7 +137,7 @@ func (store *KVStore) maybeSnapshot(rules []SnapshotRule) {
 		if int(now.Sub(store.lastSnapshot).Seconds()) >= rule.EverySeconds &&
 			store.opsSinceSnapshot >= rule.MinChanges {
 
-			_ = store.writeSnapshotLocked("snapshot.gob") // handle error in real code
+			_ = store.writeSnapshotLocked(snapshotFileName) // handle error in real code
 			store.lastSnapshot = now
 			store.opsSinceSnapshot = 0
 			return
@@ -145,6 +169,85 @@ func (store *KVStore) writeSnapshotLocked(path string) error {
 	return os.Rename(tmp, path)
 }
 
+func readSnapshot(path string) (map[string]string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return make(map[string]string), nil
+		}
+		return nil, err
+	}
+	defer f.Close()
+
+	var data map[string]string
+	if err := gob.NewDecoder(f).Decode(&data); err != nil {
+		return nil, err
+	}
+	if data == nil {
+		data = make(map[string]string)
+	}
+	return data, nil
+}
+
+func replayWAL(path string, data map[string]string) error {
+	f, err := os.Open(path)
+	if err != nil {
+		if os.IsNotExist(err) {
+			return nil
+		}
+		return err
+	}
+	defer f.Close()
+
+	dec := gob.NewDecoder(f)
+	for {
+		var rec walRecord
+		if err := dec.Decode(&rec); err != nil {
+			if err == io.EOF || err == io.ErrUnexpectedEOF {
+				return nil
+			}
+			return err
+		}
+		applyWALRecord(data, rec)
+	}
+}
+
+func applyWALRecord(data map[string]string, rec walRecord) {
+	switch rec.Op {
+	case opPut:
+		if rec.Entry.Key == "" {
+			return
+		}
+		data[rec.Entry.Key] = rec.Entry.Value
+	case opMPut:
+		for _, kv := range rec.Entries {
+			if kv.Key == "" {
+				continue
+			}
+			data[kv.Key] = kv.Value
+		}
+	case opDel:
+		if rec.Key == "" {
+			return
+		}
+		delete(data, rec.Key)
+	case opMDel:
+		for _, key := range rec.Keys {
+			if key == "" {
+				continue
+			}
+			delete(data, key)
+		}
+	case opCAS:
+		if rec.Key == "" {
+			return
+		}
+		if cur, ok := data[rec.Key]; ok && cur == rec.Expected {
+			data[rec.Key] = rec.Value
+		}
+	}
+}
+
 // WAL functions
 func (store *KVStore) appendToWALSync(rec walRecord) error {
 	if store.walEncoder == nil || store.walFile == nil {
@@ -156,17 +259,100 @@ func (store *KVStore) appendToWALSync(rec walRecord) error {
 	return store.walFile.Sync()
 }
 
-func (store *KVStore) appendToWALAsync(rec walRecord) bool {
-	if store.walCh == nil {
+func (store *KVStore) appendToWALAsync(rec walRecord) (ok bool) {
+	ch := store.walCh
+	if ch == nil {
 		return true
 	}
+	defer func() {
+		if recover() != nil {
+			ok = false
+		}
+	}()
 	select {
-	case store.walCh <- rec:
+	case ch <- rec:
 		return true
 	default:
 		// queue full: choose backpressure vs drop
 		return false
 	}
+}
+
+func (store *KVStore) Stop() bool {
+	store.mu.Lock()
+	if store.stopped {
+		store.mu.Unlock()
+		return true
+	}
+	store.stopped = true
+	store.data = make(map[string]string)
+	store.opsSinceSnapshot = 0
+	store.lastSnapshot = time.Time{}
+
+	walCh := store.walCh
+	walDone := store.walDone
+	walFile := store.walFile
+
+	store.walCh = nil
+	store.walDone = nil
+	store.walEncoder = nil
+	store.walFile = nil
+	store.mu.Unlock()
+
+	if walCh != nil {
+		close(walCh)
+		if walDone != nil {
+			<-walDone
+		}
+	}
+	if walFile != nil {
+		_ = walFile.Close()
+	}
+	return true
+}
+
+func (store *KVStore) Restart() bool {
+	if !store.Stop() {
+		return false
+	}
+
+	store.mu.Lock()
+	mode := store.mode
+	store.mu.Unlock()
+
+	data := make(map[string]string)
+	switch mode {
+	case SnapshotOnly:
+		snapshotData, err := readSnapshot(snapshotFileName)
+		if err != nil {
+			return false
+		}
+		data = snapshotData
+	case StrongWAL, FastWAL:
+		if err := replayWAL(walFileName, data); err != nil {
+			return false
+		}
+	}
+
+	store.mu.Lock()
+	store.data = data
+	store.opsSinceSnapshot = 0
+	store.lastSnapshot = time.Now()
+	if mode == SnapshotOnly && len(store.snapshotRules) == 0 {
+		store.snapshotRules = defaultSnapshotRules()
+	}
+	store.mu.Unlock()
+
+	if mode == StrongWAL || mode == FastWAL {
+		if err := store.initWAL(); err != nil {
+			return false
+		}
+	}
+
+	store.mu.Lock()
+	store.stopped = false
+	store.mu.Unlock()
+	return true
 }
 
 func (store *KVStore) Get(key string) (string, bool) {
@@ -175,6 +361,9 @@ func (store *KVStore) Get(key string) (string, bool) {
 	}
 	store.mu.Lock()
 	defer store.mu.Unlock()
+	if store.stopped {
+		return "", false
+	}
 
 	v, ok := store.data[key]
 	return v, ok
@@ -183,6 +372,9 @@ func (store *KVStore) Get(key string) (string, bool) {
 func (store *KVStore) MGet(keys []string) map[string]string {
 	store.mu.Lock()
 	defer store.mu.Unlock()
+	if store.stopped {
+		return map[string]string{}
+	}
 
 	out := make(map[string]string, len(keys))
 	for _, key := range keys {
@@ -204,6 +396,10 @@ func (store *KVStore) Put(kv Entry) bool {
 	switch store.mode {
 	case SnapshotOnly:
 		store.mu.Lock()
+		if store.stopped {
+			store.mu.Unlock()
+			return false
+		}
 		store.data[kv.Key] = kv.Value
 		store.opsSinceSnapshot++
 		store.maybeSnapshot(store.snapshotRules)
@@ -213,6 +409,9 @@ func (store *KVStore) Put(kv Entry) bool {
 	case StrongWAL:
 		store.mu.Lock()
 		defer store.mu.Unlock()
+		if store.stopped {
+			return false
+		}
 
 		if err := store.appendToWALSync(walRecord{Op: opPut, Entry: kv}); err != nil {
 			return false
@@ -222,6 +421,10 @@ func (store *KVStore) Put(kv Entry) bool {
 
 	case FastWAL:
 		store.mu.Lock()
+		if store.stopped {
+			store.mu.Unlock()
+			return false
+		}
 		store.data[kv.Key] = kv.Value
 		store.mu.Unlock()
 
@@ -229,6 +432,10 @@ func (store *KVStore) Put(kv Entry) bool {
 
 	default:
 		store.mu.Lock()
+		if store.stopped {
+			store.mu.Unlock()
+			return false
+		}
 		store.data[kv.Key] = kv.Value
 		store.mu.Unlock()
 		return true
@@ -245,6 +452,10 @@ func (store *KVStore) MPut(kvs []Entry) bool {
 	switch store.mode {
 	case SnapshotOnly:
 		store.mu.Lock()
+		if store.stopped {
+			store.mu.Unlock()
+			return false
+		}
 		for _, kv := range kvs {
 			store.data[kv.Key] = kv.Value
 		}
@@ -256,6 +467,9 @@ func (store *KVStore) MPut(kvs []Entry) bool {
 	case StrongWAL:
 		store.mu.Lock()
 		defer store.mu.Unlock()
+		if store.stopped {
+			return false
+		}
 
 		if err := store.appendToWALSync(walRecord{Op: opMPut, Entries: kvs}); err != nil {
 			return false
@@ -267,6 +481,10 @@ func (store *KVStore) MPut(kvs []Entry) bool {
 
 	case FastWAL:
 		store.mu.Lock()
+		if store.stopped {
+			store.mu.Unlock()
+			return false
+		}
 		for _, kv := range kvs {
 			store.data[kv.Key] = kv.Value
 		}
@@ -276,6 +494,10 @@ func (store *KVStore) MPut(kvs []Entry) bool {
 
 	default:
 		store.mu.Lock()
+		if store.stopped {
+			store.mu.Unlock()
+			return false
+		}
 		for _, kv := range kvs {
 			store.data[kv.Key] = kv.Value
 		}
@@ -292,6 +514,10 @@ func (store *KVStore) Delete(key string) bool {
 	switch store.mode {
 	case SnapshotOnly:
 		store.mu.Lock()
+		if store.stopped {
+			store.mu.Unlock()
+			return false
+		}
 		_, existed := store.data[key]
 		delete(store.data, key)
 		if existed {
@@ -304,6 +530,9 @@ func (store *KVStore) Delete(key string) bool {
 	case StrongWAL:
 		store.mu.Lock()
 		defer store.mu.Unlock()
+		if store.stopped {
+			return false
+		}
 
 		if err := store.appendToWALSync(walRecord{Op: opDel, Key: key}); err != nil {
 			return false
@@ -313,6 +542,10 @@ func (store *KVStore) Delete(key string) bool {
 
 	case FastWAL:
 		store.mu.Lock()
+		if store.stopped {
+			store.mu.Unlock()
+			return false
+		}
 		delete(store.data, key)
 		store.mu.Unlock()
 
@@ -320,6 +553,10 @@ func (store *KVStore) Delete(key string) bool {
 
 	default:
 		store.mu.Lock()
+		if store.stopped {
+			store.mu.Unlock()
+			return false
+		}
 		delete(store.data, key)
 		store.mu.Unlock()
 		return true
@@ -331,6 +568,10 @@ func (store *KVStore) MDelete(keys []string) int {
 	switch store.mode {
 	case SnapshotOnly:
 		store.mu.Lock()
+		if store.stopped {
+			store.mu.Unlock()
+			return 0
+		}
 		count := 0
 		for _, key := range keys {
 			if key == "" {
@@ -351,6 +592,9 @@ func (store *KVStore) MDelete(keys []string) int {
 	case StrongWAL:
 		store.mu.Lock()
 		defer store.mu.Unlock()
+		if store.stopped {
+			return 0
+		}
 
 		// WAL first
 		if err := store.appendToWALSync(walRecord{Op: opMDel, Keys: append([]string(nil), keys...)}); err != nil {
@@ -371,6 +615,10 @@ func (store *KVStore) MDelete(keys []string) int {
 
 	case FastWAL:
 		store.mu.Lock()
+		if store.stopped {
+			store.mu.Unlock()
+			return 0
+		}
 		count := 0
 		for _, key := range keys {
 			if key == "" {
@@ -393,6 +641,9 @@ func (store *KVStore) MDelete(keys []string) int {
 	default:
 		store.mu.Lock()
 		defer store.mu.Unlock()
+		if store.stopped {
+			return 0
+		}
 
 		count := 0
 		for _, key := range keys {
@@ -416,6 +667,10 @@ func (store *KVStore) CAS(key, value, expected string) bool {
 	switch store.mode {
 	case SnapshotOnly:
 		store.mu.Lock()
+		if store.stopped {
+			store.mu.Unlock()
+			return false
+		}
 		cur, ok := store.data[key]
 		if !ok || cur != expected {
 			store.mu.Unlock()
@@ -430,6 +685,9 @@ func (store *KVStore) CAS(key, value, expected string) bool {
 	case StrongWAL:
 		store.mu.Lock()
 		defer store.mu.Unlock()
+		if store.stopped {
+			return false
+		}
 
 		// check first, then WAL+apply (so you only log successful CAS)
 		cur, ok := store.data[key]
@@ -446,6 +704,10 @@ func (store *KVStore) CAS(key, value, expected string) bool {
 
 	case FastWAL:
 		store.mu.Lock()
+		if store.stopped {
+			store.mu.Unlock()
+			return false
+		}
 		cur, ok := store.data[key]
 		if !ok || cur != expected {
 			store.mu.Unlock()
@@ -459,6 +721,9 @@ func (store *KVStore) CAS(key, value, expected string) bool {
 	default:
 		store.mu.Lock()
 		defer store.mu.Unlock()
+		if store.stopped {
+			return false
+		}
 
 		cur, ok := store.data[key]
 		if !ok || cur != expected {

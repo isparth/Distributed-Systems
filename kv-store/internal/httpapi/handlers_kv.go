@@ -190,3 +190,37 @@ func handleMDelete(store *kv.KVStore) http.HandlerFunc {
 		})
 	}
 }
+
+func handleStop(store *kv.KVStore) http.HandlerFunc {
+	type resp struct {
+		Ok bool `json:"ok"`
+	}
+
+	return func(w http.ResponseWriter, r *http.Request) {
+		if !store.Stop() {
+			http.Error(w, "failed to stop store", http.StatusInternalServerError)
+			return
+		}
+
+		respond.JSON(w, http.StatusOK, resp{
+			Ok: true,
+		})
+	}
+}
+
+func handleRestart(store *kv.KVStore) http.HandlerFunc {
+	type resp struct {
+		Ok bool `json:"ok"`
+	}
+
+	return func(w http.ResponseWriter, r *http.Request) {
+		if !store.Restart() {
+			http.Error(w, "failed to restart store", http.StatusInternalServerError)
+			return
+		}
+
+		respond.JSON(w, http.StatusOK, resp{
+			Ok: true,
+		})
+	}
+}
