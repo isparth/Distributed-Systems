@@ -5,7 +5,7 @@ import (
 )
 
 func TestPutGet(t *testing.T) {
-	s := NewKVStore()
+	s := NewKVStore(NoPersistence)
 
 	s.Put("a", "1")
 	v, ok := s.Get("a")
