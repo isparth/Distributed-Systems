@@ -3,9 +3,11 @@ package kv
 import (
 	"encoding/gob"
 	"errors"
+	"fmt"
 	"io"
 	"os"
 	"sync"
+	"sync/atomic"
 	"time"
 )
 
@@ -79,9 +81,11 @@ type KVStore struct {
 	data map[string]string
 	mode DurabilityMode
 
-	// Health Fields
-	stopped             bool
-	up_to_date_Snapshot bool
+	// Health fields
+	stopped         bool
+	snapshotHealthy bool // last snapshot attempt succeeded
+	walFailed       uint32
+	lastWALError    error
 
 	// snapshot fields
 	snapshotRules    []SnapshotRule
@@ -123,17 +127,33 @@ func (store *KVStore) initWAL() error {
 	store.walEncoder = gob.NewEncoder(f)
 	store.walCh = nil
 	store.walDone = nil
+	atomic.StoreUint32(&store.walFailed, 0)
+	store.lastWALError = nil
 
 	if store.mode == FastWAL {
 		store.walCh = make(chan walRecord, 1024)
 		store.walDone = make(chan struct{})
 		enc := store.walEncoder
+		file := store.walFile
 		ch := store.walCh
 		done := store.walDone
 		go func() {
 			defer close(done)
 			for rec := range ch {
-				_ = enc.Encode(rec)
+				if err := enc.Encode(rec); err != nil {
+					store.mu.Lock()
+					store.lastWALError = err
+					store.mu.Unlock()
+					atomic.StoreUint32(&store.walFailed, 1)
+					return
+				}
+				if err := file.Sync(); err != nil {
+					store.mu.Lock()
+					store.lastWALError = err
+					store.mu.Unlock()
+					atomic.StoreUint32(&store.walFailed, 1)
+					return
+				}
 			}
 		}()
 	}
@@ -156,6 +176,7 @@ func (store *KVStore) maybeSnapshot(rules []SnapshotRule) error {
 			}
 			store.lastSnapshot = now
 			store.opsSinceSnapshot = 0
+			store.snapshotHealthy = true
 			return nil
 		}
 	}
@@ -191,7 +212,7 @@ func readSnapshot(path string) (map[string]string, error) {
 		if os.IsNotExist(err) {
 			return make(map[string]string), nil
 		}
-		return nil, ErrSnapShotFileNotOpen
+		return nil, fmt.Errorf("%w: %v", ErrSnapShotFileNotOpen, err)
 	}
 	defer f.Close()
 
@@ -270,39 +291,88 @@ func (store *KVStore) appendToWALSync(rec walRecord) error {
 		return nil
 	}
 	if err := store.walEncoder.Encode(rec); err != nil {
+		store.lastWALError = err
 		return err
 	}
-	return store.walFile.Sync()
+	if err := store.walFile.Sync(); err != nil {
+		store.lastWALError = err
+		return err
+	}
+	return nil
 }
 
 func (store *KVStore) appendToWALAsync(rec walRecord) (err error) {
+	if atomic.LoadUint32(&store.walFailed) != 0 {
+		if store.lastWALError == nil {
+			store.lastWALError = ErrWALInternal
+		}
+		return ErrWALInternal
+	}
 	ch := store.walCh
 	if ch == nil {
+		store.lastWALError = ErrWALDisabled
 		return ErrWALDisabled
 	}
 	defer func() {
 		if recover() != nil {
 			err = ErrWALStopped
+			store.lastWALError = err
 		}
 	}()
 	select {
 	case ch <- rec:
 		return nil
 	default:
+		err = ErrWALFull
+		store.lastWALError = err
 		return ErrWALFull
 	}
 }
 
-// -------- Key Value Store Functions -----------//
-func (store *KVStore) Stop() bool {
+func (store *KVStore) LastWALError() error {
 	store.mu.Lock()
 	defer store.mu.Unlock()
+	return store.lastWALError
+}
 
-	if store.stopped {
+// -------- Key Value Store Functions -----------//
+func (store *KVStore) Stop() bool {
+	var walCh chan walRecord
+	var walDone chan struct{}
+	var walFile *os.File
+
+	alreadyStopped := func() bool {
+		store.mu.Lock()
+		defer store.mu.Unlock()
+
+		if store.stopped {
+			return true
+		}
+		store.stopped = true
+
+		walCh = store.walCh
+		walDone = store.walDone
+		walFile = store.walFile
+
+		store.walCh = nil
+		store.walDone = nil
+		store.walEncoder = nil
+		store.walFile = nil
+		return false
+	}()
+	if alreadyStopped {
 		return true
 	}
-	store.stopped = true
 
+	if walCh != nil {
+		close(walCh)
+		if walDone != nil {
+			<-walDone
+		}
+	}
+	if walFile != nil {
+		_ = walFile.Close()
+	}
 	return true
 }
 
@@ -451,7 +521,7 @@ func (store *KVStore) Put(kv Entry) bool {
 		store.data[kv.Key] = kv.Value
 		store.opsSinceSnapshot++
 		if err := store.maybeSnapshot(store.snapshotRules); err != nil {
-			store.up_to_date_Snapshot = false
+			store.snapshotHealthy = false
 		}
 
 		return true
@@ -514,7 +584,7 @@ func (store *KVStore) MPut(kvs []Entry) bool {
 		}
 		store.opsSinceSnapshot += len(kvs)
 		if err := store.maybeSnapshot(store.snapshotRules); err != nil {
-			store.up_to_date_Snapshot = false
+			store.snapshotHealthy = false
 		}
 		return true
 
@@ -586,6 +656,9 @@ func (store *KVStore) Delete(key string) bool {
 			store.opsSinceSnapshot++
 
 		}
+		if err := store.maybeSnapshot(store.snapshotRules); err != nil {
+			store.snapshotHealthy = false
+		}
 
 		return true
 
@@ -654,7 +727,7 @@ func (store *KVStore) MDelete(keys []string) int {
 		}
 
 		if err := store.maybeSnapshot(store.snapshotRules); err != nil {
-			store.up_to_date_Snapshot = false
+			store.snapshotHealthy = false
 		}
 
 		return count
@@ -752,7 +825,7 @@ func (store *KVStore) CAS(key, value, expected string) bool {
 		store.opsSinceSnapshot++
 
 		if err := store.maybeSnapshot(store.snapshotRules); err != nil {
-			store.up_to_date_Snapshot = false
+			store.snapshotHealthy = false
 		}
 
 		return true
