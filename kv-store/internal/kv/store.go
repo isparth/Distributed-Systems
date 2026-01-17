@@ -2,10 +2,18 @@ package kv
 
 import (
 	"encoding/gob"
+	"errors"
 	"io"
 	"os"
 	"sync"
 	"time"
+)
+
+var (
+	ErrWALFull     = errors.New("wal full")
+	ErrWALStopped  = errors.New("wal stopped")
+	ErrWALDisabled = errors.New("wal disabled")
+	ErrWALInternal = errors.New("wal internal")
 )
 
 type Entry struct {
@@ -259,21 +267,21 @@ func (store *KVStore) appendToWALSync(rec walRecord) error {
 	return store.walFile.Sync()
 }
 
-func (store *KVStore) appendToWALAsync(rec walRecord) (ok bool) {
+func (store *KVStore) appendToWALAsync(rec walRecord) (err error) {
 	ch := store.walCh
 	if ch == nil {
-		return true
+		return ErrWALDisabled
 	}
 	defer func() {
 		if recover() != nil {
-			ok = false
+			err = ErrWALStopped
 		}
 	}()
 	select {
 	case ch <- rec:
-		return true
+		return nil
 	default:
-		return false
+		return ErrWALFull
 	}
 }
 
@@ -439,7 +447,7 @@ func (store *KVStore) Put(kv Entry) bool {
 		if store.stopped {
 			return false
 		}
-		if !store.appendToWALAsync(walRecord{Op: opPut, Entry: kv}) {
+		if err := store.appendToWALAsync(walRecord{Op: opPut, Entry: kv}); err != nil {
 			return false
 		}
 		store.data[kv.Key] = kv.Value
@@ -498,16 +506,20 @@ func (store *KVStore) MPut(kvs []Entry) bool {
 
 	case FastWAL:
 		store.mu.Lock()
+		defer store.mu.Unlock()
 		if store.stopped {
-			store.mu.Unlock()
 			return false
 		}
+
+		if err := store.appendToWALAsync(walRecord{Op: opMPut, Entries: kvs}); err != nil {
+			return false
+		}
+
 		for _, kv := range kvs {
 			store.data[kv.Key] = kv.Value
 		}
-		store.mu.Unlock()
 
-		return store.appendToWALAsync(walRecord{Op: opMPut, Entries: kvs})
+		return true
 
 	default:
 		store.mu.Lock()
@@ -560,14 +572,18 @@ func (store *KVStore) Delete(key string) bool {
 
 	case FastWAL:
 		store.mu.Lock()
+		defer store.mu.Unlock()
 		if store.stopped {
-			store.mu.Unlock()
+
 			return false
 		}
-		delete(store.data, key)
-		store.mu.Unlock()
+		if err := store.appendToWALAsync(walRecord{Op: opDel, Key: key}); err != nil {
+			return false
+		}
 
-		return store.appendToWALAsync(walRecord{Op: opDel, Key: key})
+		delete(store.data, key)
+
+		return true
 
 	default:
 		store.mu.Lock()
@@ -634,10 +650,17 @@ func (store *KVStore) MDelete(keys []string) int {
 
 	case FastWAL:
 		store.mu.Lock()
+		defer store.mu.Unlock()
+
 		if store.stopped {
-			store.mu.Unlock()
 			return 0
 		}
+
+		// WAL first
+		if err := store.appendToWALAsync(walRecord{Op: opMDel, Keys: append([]string(nil), keys...)}); err != nil {
+			return 0
+		}
+
 		count := 0
 		for _, key := range keys {
 			if key == "" {
@@ -647,13 +670,6 @@ func (store *KVStore) MDelete(keys []string) int {
 				delete(store.data, key)
 				count++
 			}
-		}
-		store.mu.Unlock()
-
-		ok := store.appendToWALAsync(walRecord{Op: opMDel, Keys: append([]string(nil), keys...)})
-		if !ok {
-			// memory already changed; you can’t “undo” without extra machinery
-			// returning count still reflects what happened in memory
 		}
 		return count
 
@@ -724,8 +740,9 @@ func (store *KVStore) CAS(key, value, expected string) bool {
 
 	case FastWAL:
 		store.mu.Lock()
+		defer store.mu.Unlock()
+
 		if store.stopped {
-			store.mu.Unlock()
 			return false
 		}
 		cur, ok := store.data[key]
@@ -733,10 +750,13 @@ func (store *KVStore) CAS(key, value, expected string) bool {
 			store.mu.Unlock()
 			return false
 		}
-		store.data[key] = value
-		store.mu.Unlock()
 
-		return store.appendToWALAsync(walRecord{Op: opCAS, Key: key, Value: value, Expected: expected})
+		if err := store.appendToWALAsync(walRecord{Op: opCAS, Key: key, Value: value, Expected: expected}); err != nil {
+			return false
+		}
+
+		store.data[key] = value
+		return true
 
 	default:
 		store.mu.Lock()
