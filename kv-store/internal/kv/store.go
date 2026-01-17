@@ -28,8 +28,8 @@ const (
 )
 
 const (
-	defaultSnapshotEverySeconds = 30
-	defaultSnapshotMinChanges   = 100
+	defaultSnapshotEverySeconds = 15
+	defaultSnapshotMinChanges   = 2
 	walFileName                 = "wal.log"
 	snapshotFileName            = "snapshot.gob"
 )
@@ -278,6 +278,17 @@ func (store *KVStore) appendToWALAsync(rec walRecord) (ok bool) {
 }
 
 func (store *KVStore) Stop() bool {
+	store.mu.Lock()
+	if store.stopped {
+		store.mu.Unlock()
+		return true
+	}
+	store.stopped = true
+
+	return true
+}
+
+func (store *KVStore) Reset() bool {
 	store.mu.Lock()
 	if store.stopped {
 		store.mu.Unlock()
