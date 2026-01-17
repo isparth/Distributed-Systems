@@ -137,15 +137,15 @@ func (store *KVStore) initWAL() error {
 	return nil
 }
 
+// --------Snapshot Functionality --------//
 func (store *KVStore) maybeSnapshot(rules []SnapshotRule) {
-	// store.mu should already be held OR you take it inside (pick one)
 	now := time.Now()
 
 	for _, rule := range rules {
 		if int(now.Sub(store.lastSnapshot).Seconds()) >= rule.EverySeconds &&
 			store.opsSinceSnapshot >= rule.MinChanges {
 
-			_ = store.writeSnapshotLocked(snapshotFileName) // handle error in real code
+			_ = store.writeSnapshotLocked(snapshotFileName)
 			store.lastSnapshot = now
 			store.opsSinceSnapshot = 0
 			return
@@ -154,7 +154,6 @@ func (store *KVStore) maybeSnapshot(rules []SnapshotRule) {
 }
 
 func (store *KVStore) writeSnapshotLocked(path string) error {
-	// assumes store.mu is held (so map doesn't change while encoding)
 	tmp := path + ".tmp"
 
 	f, err := os.OpenFile(tmp, os.O_CREATE|os.O_TRUNC|os.O_WRONLY, 0644)
@@ -197,6 +196,7 @@ func readSnapshot(path string) (map[string]string, error) {
 	return data, nil
 }
 
+// --------- Write Ahead Log Functionality --------------//
 func replayWAL(path string, data map[string]string) error {
 	f, err := os.Open(path)
 	if err != nil {
@@ -256,7 +256,6 @@ func applyWALRecord(data map[string]string, rec walRecord) {
 	}
 }
 
-// WAL functions
 func (store *KVStore) appendToWALSync(rec walRecord) error {
 	if store.walEncoder == nil || store.walFile == nil {
 		return nil
@@ -285,10 +284,12 @@ func (store *KVStore) appendToWALAsync(rec walRecord) (err error) {
 	}
 }
 
+// -------- Key Value Store Functions -----------//
 func (store *KVStore) Stop() bool {
 	store.mu.Lock()
+	defer store.mu.Unlock()
+
 	if store.stopped {
-		store.mu.Unlock()
 		return true
 	}
 	store.stopped = true
@@ -331,7 +332,7 @@ func (store *KVStore) Reset() bool {
 
 // Restart Operation it
 func (store *KVStore) Restart() bool {
-	if !store.Stop() {
+	if !store.Reset() {
 		return false
 	}
 
@@ -703,13 +704,13 @@ func (store *KVStore) CAS(key, value, expected string) bool {
 	switch store.mode {
 	case SnapshotOnly:
 		store.mu.Lock()
+		defer store.mu.Unlock()
+
 		if store.stopped {
-			store.mu.Unlock()
 			return false
 		}
 		cur, ok := store.data[key]
 		if !ok || cur != expected {
-			store.mu.Unlock()
 			return false
 		}
 		store.data[key] = value
@@ -747,7 +748,6 @@ func (store *KVStore) CAS(key, value, expected string) bool {
 		}
 		cur, ok := store.data[key]
 		if !ok || cur != expected {
-			store.mu.Unlock()
 			return false
 		}
 

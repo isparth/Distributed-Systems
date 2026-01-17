@@ -208,6 +208,23 @@ func handleStop(store *kv.KVStore) http.HandlerFunc {
 	}
 }
 
+func handleReset(store *kv.KVStore) http.HandlerFunc {
+	type resp struct {
+		Ok bool `json:"ok"`
+	}
+
+	return func(w http.ResponseWriter, r *http.Request) {
+		if !store.Reset() {
+			http.Error(w, "failed to reset store", http.StatusInternalServerError)
+			return
+		}
+
+		respond.JSON(w, http.StatusOK, resp{
+			Ok: true,
+		})
+	}
+}
+
 func handleRestart(store *kv.KVStore) http.HandlerFunc {
 	type resp struct {
 		Ok bool `json:"ok"`

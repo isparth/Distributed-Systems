@@ -11,6 +11,7 @@ func registerRoutes(r chi.Router, kv *kv.KVStore) {
 	r.Route("/kv", func(r chi.Router) {
 		r.Get("/healthz", handleHealthz())
 		r.Post("/stop", handleStop(kv))
+		r.Post("/Reset", handleReset(kv))
 		r.Post("/restart", handleRestart(kv))
 		r.Get("/{key}", handleGet(kv))
 		r.Put("/{key}", handlePut(kv))
@@ -18,6 +19,5 @@ func registerRoutes(r chi.Router, kv *kv.KVStore) {
 		r.Post("/mget", handleMGet(kv))
 		r.Put("/mput", handleMPut(kv))
 		r.Post("/mdelete", handleMDelete(kv))
-
 	})
 }
