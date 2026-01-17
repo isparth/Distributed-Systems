@@ -10,10 +10,11 @@ import (
 )
 
 var (
-	ErrWALFull     = errors.New("wal full")
-	ErrWALStopped  = errors.New("wal stopped")
-	ErrWALDisabled = errors.New("wal disabled")
-	ErrWALInternal = errors.New("wal internal")
+	ErrSnapShotFileNotOpen = errors.New("Snapshot file could not open")
+	ErrWALFull             = errors.New("wal full")
+	ErrWALStopped          = errors.New("wal stopped")
+	ErrWALDisabled         = errors.New("wal disabled")
+	ErrWALInternal         = errors.New("wal internal")
 )
 
 type Entry struct {
@@ -74,17 +75,20 @@ func defaultSnapshotRules() []SnapshotRule {
 }
 
 type KVStore struct {
-	mu      sync.Mutex
-	data    map[string]string
-	mode    DurabilityMode
-	stopped bool
+	mu   sync.Mutex
+	data map[string]string
+	mode DurabilityMode
+
+	// Health Fields
+	stopped             bool
+	up_to_date_Snapshot bool
 
 	// snapshot fields
 	snapshotRules    []SnapshotRule
 	lastSnapshot     time.Time
 	opsSinceSnapshot int
 
-	// Write ahead log fields.
+	// Write ahead log fields
 	walCh      chan walRecord
 	walDone    chan struct{}
 	walEncoder *gob.Encoder
@@ -138,19 +142,24 @@ func (store *KVStore) initWAL() error {
 }
 
 // --------Snapshot Functionality --------//
-func (store *KVStore) maybeSnapshot(rules []SnapshotRule) {
+func (store *KVStore) maybeSnapshot(rules []SnapshotRule) error {
 	now := time.Now()
 
 	for _, rule := range rules {
 		if int(now.Sub(store.lastSnapshot).Seconds()) >= rule.EverySeconds &&
 			store.opsSinceSnapshot >= rule.MinChanges {
 
-			_ = store.writeSnapshotLocked(snapshotFileName)
+			err := store.writeSnapshotLocked(snapshotFileName)
+
+			if err != nil {
+				return err
+			}
 			store.lastSnapshot = now
 			store.opsSinceSnapshot = 0
-			return
+			return nil
 		}
 	}
+	return nil
 }
 
 func (store *KVStore) writeSnapshotLocked(path string) error {
@@ -182,7 +191,7 @@ func readSnapshot(path string) (map[string]string, error) {
 		if os.IsNotExist(err) {
 			return make(map[string]string), nil
 		}
-		return nil, err
+		return nil, ErrSnapShotFileNotOpen
 	}
 	defer f.Close()
 
@@ -298,25 +307,35 @@ func (store *KVStore) Stop() bool {
 }
 
 func (store *KVStore) Reset() bool {
-	store.mu.Lock()
-	if store.stopped {
-		store.mu.Unlock()
+	var walCh chan walRecord
+	var walDone chan struct{}
+	var walFile *os.File
+
+	alreadyStopped := func() bool {
+		store.mu.Lock()
+		defer store.mu.Unlock()
+
+		if store.stopped {
+			return true
+		}
+		store.stopped = true
+		store.data = make(map[string]string)
+		store.opsSinceSnapshot = 0
+		store.lastSnapshot = time.Time{}
+
+		walCh = store.walCh
+		walDone = store.walDone
+		walFile = store.walFile
+
+		store.walCh = nil
+		store.walDone = nil
+		store.walEncoder = nil
+		store.walFile = nil
+		return false
+	}()
+	if alreadyStopped {
 		return true
 	}
-	store.stopped = true
-	store.data = make(map[string]string)
-	store.opsSinceSnapshot = 0
-	store.lastSnapshot = time.Time{}
-
-	walCh := store.walCh
-	walDone := store.walDone
-	walFile := store.walFile
-
-	store.walCh = nil
-	store.walDone = nil
-	store.walEncoder = nil
-	store.walFile = nil
-	store.mu.Unlock()
 
 	if walCh != nil {
 		close(walCh)
@@ -336,9 +355,11 @@ func (store *KVStore) Restart() bool {
 		return false
 	}
 
-	store.mu.Lock()
-	mode := store.mode
-	store.mu.Unlock()
+	mode := func() DurabilityMode {
+		store.mu.Lock()
+		defer store.mu.Unlock()
+		return store.mode
+	}()
 
 	data := make(map[string]string)
 	switch mode {
@@ -354,14 +375,16 @@ func (store *KVStore) Restart() bool {
 		}
 	}
 
-	store.mu.Lock()
-	store.data = data
-	store.opsSinceSnapshot = 0
-	store.lastSnapshot = time.Now()
-	if mode == SnapshotOnly && len(store.snapshotRules) == 0 {
-		store.snapshotRules = defaultSnapshotRules()
-	}
-	store.mu.Unlock()
+	func() {
+		store.mu.Lock()
+		defer store.mu.Unlock()
+		store.data = data
+		store.opsSinceSnapshot = 0
+		store.lastSnapshot = time.Now()
+		if mode == SnapshotOnly && len(store.snapshotRules) == 0 {
+			store.snapshotRules = defaultSnapshotRules()
+		}
+	}()
 
 	if mode == StrongWAL || mode == FastWAL {
 		if err := store.initWAL(); err != nil {
@@ -369,9 +392,11 @@ func (store *KVStore) Restart() bool {
 		}
 	}
 
-	store.mu.Lock()
-	store.stopped = false
-	store.mu.Unlock()
+	func() {
+		store.mu.Lock()
+		defer store.mu.Unlock()
+		store.stopped = false
+	}()
 	return true
 }
 
@@ -425,7 +450,9 @@ func (store *KVStore) Put(kv Entry) bool {
 
 		store.data[kv.Key] = kv.Value
 		store.opsSinceSnapshot++
-		store.maybeSnapshot(store.snapshotRules)
+		if err := store.maybeSnapshot(store.snapshotRules); err != nil {
+			store.up_to_date_Snapshot = false
+		}
 
 		return true
 
@@ -478,16 +505,17 @@ func (store *KVStore) MPut(kvs []Entry) bool {
 	switch store.mode {
 	case SnapshotOnly:
 		store.mu.Lock()
+		defer store.mu.Unlock()
 		if store.stopped {
-			store.mu.Unlock()
 			return false
 		}
 		for _, kv := range kvs {
 			store.data[kv.Key] = kv.Value
 		}
 		store.opsSinceSnapshot += len(kvs)
-		store.maybeSnapshot(store.snapshotRules)
-		store.mu.Unlock()
+		if err := store.maybeSnapshot(store.snapshotRules); err != nil {
+			store.up_to_date_Snapshot = false
+		}
 		return true
 
 	case StrongWAL:
@@ -524,14 +552,15 @@ func (store *KVStore) MPut(kvs []Entry) bool {
 
 	default:
 		store.mu.Lock()
+		defer store.mu.Unlock()
+
 		if store.stopped {
-			store.mu.Unlock()
 			return false
 		}
 		for _, kv := range kvs {
 			store.data[kv.Key] = kv.Value
 		}
-		store.mu.Unlock()
+
 		return true
 	}
 }
@@ -545,17 +574,19 @@ func (store *KVStore) Delete(key string) bool {
 	switch store.mode {
 	case SnapshotOnly:
 		store.mu.Lock()
+		defer store.mu.Unlock()
+
 		if store.stopped {
-			store.mu.Unlock()
 			return false
 		}
 		_, existed := store.data[key]
-		delete(store.data, key)
+
 		if existed {
+			delete(store.data, key)
 			store.opsSinceSnapshot++
-			store.maybeSnapshot(store.snapshotRules)
+
 		}
-		store.mu.Unlock()
+
 		return true
 
 	case StrongWAL:
@@ -588,12 +619,11 @@ func (store *KVStore) Delete(key string) bool {
 
 	default:
 		store.mu.Lock()
+		defer store.mu.Unlock()
 		if store.stopped {
-			store.mu.Unlock()
 			return false
 		}
 		delete(store.data, key)
-		store.mu.Unlock()
 		return true
 	}
 }
@@ -604,10 +634,11 @@ func (store *KVStore) MDelete(keys []string) int {
 	switch store.mode {
 	case SnapshotOnly:
 		store.mu.Lock()
+		defer store.mu.Unlock()
 		if store.stopped {
-			store.mu.Unlock()
 			return 0
 		}
+
 		count := 0
 		for _, key := range keys {
 			if key == "" {
@@ -620,9 +651,12 @@ func (store *KVStore) MDelete(keys []string) int {
 		}
 		if count > 0 {
 			store.opsSinceSnapshot += count
-			store.maybeSnapshot(store.snapshotRules)
 		}
-		store.mu.Unlock()
+
+		if err := store.maybeSnapshot(store.snapshotRules); err != nil {
+			store.up_to_date_Snapshot = false
+		}
+
 		return count
 
 	case StrongWAL:
@@ -713,10 +747,14 @@ func (store *KVStore) CAS(key, value, expected string) bool {
 		if !ok || cur != expected {
 			return false
 		}
+
 		store.data[key] = value
 		store.opsSinceSnapshot++
-		store.maybeSnapshot(store.snapshotRules)
-		store.mu.Unlock()
+
+		if err := store.maybeSnapshot(store.snapshotRules); err != nil {
+			store.up_to_date_Snapshot = false
+		}
+
 		return true
 
 	case StrongWAL:
