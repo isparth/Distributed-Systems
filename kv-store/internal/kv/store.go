@@ -408,14 +408,16 @@ func (store *KVStore) Put(kv Entry) bool {
 	switch store.mode {
 	case SnapshotOnly:
 		store.mu.Lock()
+		defer store.mu.Unlock()
+
 		if store.stopped {
-			store.mu.Unlock()
 			return false
 		}
+
 		store.data[kv.Key] = kv.Value
 		store.opsSinceSnapshot++
 		store.maybeSnapshot(store.snapshotRules)
-		store.mu.Unlock()
+
 		return true
 
 	case StrongWAL:
@@ -433,23 +435,25 @@ func (store *KVStore) Put(kv Entry) bool {
 
 	case FastWAL:
 		store.mu.Lock()
+		defer store.mu.Unlock()
 		if store.stopped {
-			store.mu.Unlock()
+			return false
+		}
+		if !store.appendToWALAsync(walRecord{Op: opPut, Entry: kv}) {
 			return false
 		}
 		store.data[kv.Key] = kv.Value
-		store.mu.Unlock()
 
-		return store.appendToWALAsync(walRecord{Op: opPut, Entry: kv})
+		return true
 
 	default:
 		store.mu.Lock()
+		defer store.mu.Unlock()
 		if store.stopped {
-			store.mu.Unlock()
 			return false
 		}
 		store.data[kv.Key] = kv.Value
-		store.mu.Unlock()
+
 		return true
 	}
 }
