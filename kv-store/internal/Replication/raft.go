@@ -1,5 +1,13 @@
 package Replication
 
+
+type Role int
+
+const (
+	Follower Role = iota
+	Leader
+)
+
 struct RaftNode {
 	ID        string
 	Term      int
@@ -7,6 +15,7 @@ struct RaftNode {
 	Log       []LogEntry
 	CommitIdx int
 	LastApplied int
+	role        Role
 }
 
 struct LogEntry {
