@@ -1,0 +1,15 @@
+TODO list (ordered)
+
+Define a storage interface in internal/httpapi so handlers depend on an abstraction, not directly on internal/kv (this is the seam where Raft mode plugs in).
+Create a Raft package boundary (e.g., internal/replication), and make raft.go compile by fleshing out types, roles, and persisted state in real Go style (right now it’s a sketch).
+Decide and document your read semantics (stale follower reads vs leader‑only or linearizable reads) and reflect that in handler behavior.
+Define the log command format (put/delete/cas/etc.) and the rule: KV mutates only by applying committed log entries in order.
+Implement Raft core roles and timers (follower/candidate/leader, election timeouts, heartbeats) and the two RPCs (AppendEntries, RequestVote).
+Implement log replication bookkeeping (nextIndex/matchIndex per follower) and commit advancement rules.
+Implement apply loop: advance lastApplied up to commitIndex and apply entries to KV state machine deterministically.
+Implement persistence for Raft stable state + log (term, votedFor, log) separate from the KV’s current WAL/snapshot (or explicitly retire KV persistence in Raft mode).
+Implement Raft snapshots + log compaction, and a snapshot install path into KV state.
+Add membership change support using joint consensus and learner (non‑voting) catch‑up flow.
+Wire HTTP routes to the new replicated store: leader handles writes; followers either redirect or forward; reads depend on chosen semantics.
+Add operational endpoints/config: cluster membership at startup, node ID, peer addresses, and leader hint.
+Add tests: log replication, commit/apply invariants, leader election, crash/restart persistence, membership change safety.
