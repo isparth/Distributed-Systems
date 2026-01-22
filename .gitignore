@@ -1,0 +1,35 @@
+# Go build artifacts
+/bin/
+/pkg/
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+
+# Go workspace
+/go.work
+/go.work.sum
+
+# Coverage
+*.cover
+coverage/
+
+# Logs
+*.log
+*.gob
+
+# Editor/OS files
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Local env
+.env
+
+# Temp
+tmp/
