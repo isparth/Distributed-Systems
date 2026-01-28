@@ -12,17 +12,25 @@ import (
 
 // mockHandler implements RaftRPCHandler for testing.
 type mockHandler struct {
-	lastReq  AppendEntriesRequest
-	respTerm uint64
+	lastAEReq  AppendEntriesRequest
+	lastRVReq  RequestVoteRequest
+	aeRespTerm uint64
+	rvRespTerm uint64
+	voteGrant  bool
 }
 
 func (m *mockHandler) HandleAppendEntries(_ context.Context, req AppendEntriesRequest) (AppendEntriesResponse, error) {
-	m.lastReq = req
-	return AppendEntriesResponse{Term: m.respTerm, Success: true}, nil
+	m.lastAEReq = req
+	return AppendEntriesResponse{Term: m.aeRespTerm, Success: true}, nil
+}
+
+func (m *mockHandler) HandleRequestVote(_ context.Context, req RequestVoteRequest) (RequestVoteResponse, error) {
+	m.lastRVReq = req
+	return RequestVoteResponse{Term: m.rvRespTerm, VoteGranted: m.voteGrant}, nil
 }
 
 func TestTransportHTTP_AppendEntries_RoundTrip(t *testing.T) {
-	handler := &mockHandler{respTerm: 3}
+	handler := &mockHandler{aeRespTerm: 3}
 	raftSrv := NewRaftHTTPServer(handler)
 	ts := httptest.NewServer(raftSrv.Handler())
 	defer ts.Close()
@@ -54,11 +62,11 @@ func TestTransportHTTP_AppendEntries_RoundTrip(t *testing.T) {
 	if resp.Term != 3 {
 		t.Fatalf("expected term 3, got %d", resp.Term)
 	}
-	if handler.lastReq.LeaderID != "node1" {
-		t.Fatalf("expected leader node1, got %s", handler.lastReq.LeaderID)
+	if handler.lastAEReq.LeaderID != "node1" {
+		t.Fatalf("expected leader node1, got %s", handler.lastAEReq.LeaderID)
 	}
-	if len(handler.lastReq.Entries) != 1 || handler.lastReq.Entries[0].Cmd.Key != "k" {
-		t.Fatalf("entries mismatch: %+v", handler.lastReq.Entries)
+	if len(handler.lastAEReq.Entries) != 1 || handler.lastAEReq.Entries[0].Cmd.Key != "k" {
+		t.Fatalf("entries mismatch: %+v", handler.lastAEReq.Entries)
 	}
 }
 
@@ -75,5 +83,41 @@ func TestTransportHTTP_BadJSON_Returns400(t *testing.T) {
 	defer resp.Body.Close()
 	if resp.StatusCode != 400 {
 		t.Fatalf("expected 400, got %d", resp.StatusCode)
+	}
+}
+
+func TestTransportHTTP_RequestVote_RoundTrip(t *testing.T) {
+	handler := &mockHandler{rvRespTerm: 5, voteGrant: true}
+	raftSrv := NewRaftHTTPServer(handler)
+	ts := httptest.NewServer(raftSrv.Handler())
+	defer ts.Close()
+
+	resolver := NewPeerResolver(map[types.NodeID]string{
+		"node2": ts.URL,
+	})
+	transport := NewHTTPTransport(resolver)
+
+	req := RequestVoteRequest{
+		Term:         5,
+		CandidateID:  "node1",
+		LastLogIndex: 10,
+		LastLogTerm:  4,
+	}
+
+	resp, err := transport.RequestVote(context.Background(), "node2", req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !resp.VoteGranted {
+		t.Fatal("expected vote granted")
+	}
+	if resp.Term != 5 {
+		t.Fatalf("expected term 5, got %d", resp.Term)
+	}
+	if handler.lastRVReq.CandidateID != "node1" {
+		t.Fatalf("expected candidate node1, got %s", handler.lastRVReq.CandidateID)
+	}
+	if handler.lastRVReq.LastLogIndex != 10 || handler.lastRVReq.LastLogTerm != 4 {
+		t.Fatalf("request mismatch: %+v", handler.lastRVReq)
 	}
 }
