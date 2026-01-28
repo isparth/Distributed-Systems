@@ -103,6 +103,17 @@ type LeaderHint struct {
 	LeaderAddr string `json:"leader_addr,omitempty"`
 }
 
+// NodeStatus holds status info about a Raft node.
+type NodeStatus struct {
+	ID          NodeID     `json:"id"`
+	Role        string     `json:"role"`
+	Term        uint64     `json:"term"`
+	CommitIndex uint64     `json:"commit_index"`
+	LastApplied uint64     `json:"last_applied"`
+	LastIndex   uint64     `json:"last_index"`
+	LeaderHint  LeaderHint `json:"leader_hint"`
+}
+
 // OpID identifies an async operation.
 type OpID string
 
