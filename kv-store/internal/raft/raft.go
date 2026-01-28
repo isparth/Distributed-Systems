@@ -263,6 +263,10 @@ func (n *Node) startElection() {
 
 	for _, p := range peers {
 		go func(peer types.NodeID) {
+			if n.tp == nil {
+				results <- voteResult{err: fmt.Errorf("no transport")}
+				return
+			}
 			resp, err := n.tp.RequestVote(ctx, peer, req)
 			results <- voteResult{resp, err}
 		}(p)
@@ -367,6 +371,9 @@ func (n *Node) sendHeartbeats() {
 
 	for _, p := range peers {
 		go func(peer types.NodeID) {
+			if n.tp == nil {
+				return
+			}
 			ctx, cancel := context.WithTimeout(n.ctx, n.cfg.Timing.HeartbeatInterval)
 			defer cancel()
 			resp, err := n.tp.AppendEntries(ctx, peer, req)
@@ -459,6 +466,10 @@ func (n *Node) Propose(ctx context.Context, cmd types.Command) (types.ApplyResul
 
 	for _, p := range peers {
 		go func(peer types.NodeID) {
+			if n.tp == nil {
+				results <- peerResult{err: fmt.Errorf("no transport")}
+				return
+			}
 			resp, err := n.tp.AppendEntries(ctx, peer, req)
 			results <- peerResult{resp, err}
 		}(p)
@@ -503,7 +514,9 @@ func (n *Node) Propose(ctx context.Context, cmd types.Command) (types.ApplyResul
 		LeaderCommit: newIdx,
 	}
 	for _, p := range peers {
-		go n.tp.AppendEntries(ctx, p, commitNotify)
+		if n.tp != nil {
+			go n.tp.AppendEntries(ctx, p, commitNotify)
+		}
 	}
 
 	// Wait for apply
