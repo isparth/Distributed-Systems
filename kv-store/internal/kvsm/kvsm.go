@@ -185,3 +185,14 @@ func (sm *KVStateMachine) LastSeen(clientID string) (uint64, bool) {
 	}
 	return rec.LastSeq, true
 }
+
+// All returns a copy of all key-value pairs.
+func (sm *KVStateMachine) All() map[string]string {
+	sm.mu.Lock()
+	defer sm.mu.Unlock()
+	result := make(map[string]string, len(sm.kv))
+	for k, v := range sm.kv {
+		result[k] = v
+	}
+	return result
+}
