@@ -24,11 +24,10 @@ import (
 func Run() error {
 	port := flag.Int("port", 8080, "HTTP listen port")
 	nodeID := flag.String("id", "node1", "Node ID")
-	role := flag.String("role", "follower", "Node role: leader or follower")
 	peersFlag := flag.String("peers", "", "Comma-separated list of peer_id=addr pairs (e.g. node2=http://localhost:8081)")
 	flag.Parse()
 
-	log.Printf("starting node %s on port %d as %s", *nodeID, *port, *role)
+	log.Printf("starting node %s on port %d", *nodeID, *port)
 
 	addr := fmt.Sprintf("http://localhost:%d", *port)
 
@@ -49,9 +48,6 @@ func Run() error {
 
 	sm := kvsm.New()
 	stable := storage.NewMemStableStore()
-	if *role == "leader" {
-		stable.SetCurrentTerm(1)
-	}
 	logStore := storage.NewMemLogStore()
 	snapStore := storage.NewMemSnapshotStore()
 
@@ -62,7 +58,6 @@ func Run() error {
 		ID:    types.NodeID(*nodeID),
 		Peers: peerIDs,
 		Addr:  addr,
-		Role:  *role,
 	}
 
 	node, err := raft.NewNode(cfg, stable, logStore, snapStore, tp, sm)
