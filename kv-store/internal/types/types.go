@@ -1,28 +1,49 @@
 package types
 
+// NodeID identifies a node in the cluster.
 type NodeID string
 
-//enum of read policy
-//Stale is the follower node gives the data it has
-//Readindex colsults the leader before goving the data
+// ReadPolicy controls how reads are served.
 type ReadPolicy int
+
 const (
-	ReadPolicyStale ReadPolicy = iota
+	ReadPolicyStale     ReadPolicy = iota
 	ReadPolicyReadIndex
 )
 
-//enum of write mode
+func (r ReadPolicy) String() string {
+	switch r {
+	case ReadPolicyStale:
+		return "stale"
+	case ReadPolicyReadIndex:
+		return "read_index"
+	default:
+		return "unknown"
+	}
+}
 
-//Sync: wait for the write to be applied
-//Async: return immediately after the write is appended to the log
+// WriteMode controls how writes are acknowledged.
 type WriteMode int
+
 const (
-	WriteModeSync WriteMode = iota
+	WriteModeSync  WriteMode = iota
 	WriteModeAsync
 )
 
-//Enums for Write operations
+func (w WriteMode) String() string {
+	switch w {
+	case WriteModeSync:
+		return "sync"
+	case WriteModeAsync:
+		return "async"
+	default:
+		return "unknown"
+	}
+}
+
+// OpType identifies the operation type.
 type OpType int
+
 const (
 	OpPut OpType = iota
 	OpDelete
@@ -31,48 +52,63 @@ const (
 	OpBatchDelete
 )
 
+func (o OpType) String() string {
+	switch o {
+	case OpPut:
+		return "put"
+	case OpDelete:
+		return "delete"
+	case OpCAS:
+		return "cas"
+	case OpBatchPut:
+		return "batch_put"
+	case OpBatchDelete:
+		return "batch_delete"
+	default:
+		return "unknown"
+	}
+}
+
+// Entry is a key-value pair used in batch operations.
 type Entry struct {
 	Key   string `json:"key"`
 	Value string `json:"value"`
 }
 
+// Command represents an operation to be applied to the state machine.
 type Command struct {
-	ClientID string `json:"client_id"`
-	Seq      uint64 `json:"seq"`
-	Op       OpType `json:"op"`
-
-	// Single-key ops
-	Key      string `json:"key,omitempty"`
-	Value    string `json:"value,omitempty"`
-	Expected string `json:"expected,omitempty"`
-
-	// Batch ops
-	Entries []Entry  `json:"entries,omitempty"`
-	Keys    []string `json:"keys,omitempty"`
+	ClientID string  `json:"client_id"`
+	Seq      uint64  `json:"seq"`
+	Op       OpType  `json:"op"`
+	Key      string  `json:"key,omitempty"`
+	Value    string  `json:"value,omitempty"`
+	Expected string  `json:"expected,omitempty"`
+	Entries  []Entry `json:"entries,omitempty"`
+	Keys     []string `json:"keys,omitempty"`
 }
 
+// ApplyResult is the result of applying a command.
 type ApplyResult struct {
-	Ok      bool              `json:"ok,omitempty"`
+	Ok      bool              `json:"ok"`
 	Value   string            `json:"value,omitempty"`
 	Values  map[string]string `json:"values,omitempty"`
 	Deleted int               `json:"deleted,omitempty"`
-
-	// Optional error signaling for clients (still JSON)
-	ErrCode string `json:"err_code,omitempty"`
-	ErrMsg  string `json:"err_msg,omitempty"`
+	ErrCode string            `json:"err_code,omitempty"`
+	ErrMsg  string            `json:"err_msg,omitempty"`
 }
 
-//information about the leader
+// LeaderHint tells clients where the leader is.
 type LeaderHint struct {
 	LeaderID   NodeID `json:"leader_id,omitempty"`
 	LeaderAddr string `json:"leader_addr,omitempty"`
 }
 
-// Used by async write mode
+// OpID identifies an async operation.
 type OpID string
 
+// OpResult is the result of an async operation.
 type OpResult struct {
-	OpID   OpID        `json:"op_id"`
+	OpID   OpID         `json:"op_id"`
 	Result *ApplyResult `json:"result,omitempty"`
-	Ready  bool        `json:"ready"`
+	Ready  bool         `json:"ready"`
 }
