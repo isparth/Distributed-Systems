@@ -12,6 +12,7 @@ type RaftNodeIface interface {
 	Propose(ctx context.Context, cmd types.Command) (types.ApplyResult, error)
 	IsLeader() bool
 	LeaderHint() types.LeaderHint
+	Status() types.NodeStatus
 }
 
 // Config configures the DistributedKV layer.
@@ -39,6 +40,14 @@ func (d *DistributedKV) IsLeader() bool {
 
 func (d *DistributedKV) LeaderHint() types.LeaderHint {
 	return d.node.LeaderHint()
+}
+
+func (d *DistributedKV) Status() types.NodeStatus {
+	return d.node.Status()
+}
+
+func (d *DistributedKV) All() map[string]string {
+	return d.sm.All()
 }
 
 // --- Reads (stale, from local SM) ---

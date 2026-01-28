@@ -27,6 +27,14 @@ func (m *mockRaftNode) LeaderHint() types.LeaderHint {
 	return m.leaderHint
 }
 
+func (m *mockRaftNode) Status() types.NodeStatus {
+	return types.NodeStatus{
+		ID:         "mock",
+		Role:       "leader",
+		LeaderHint: m.leaderHint,
+	}
+}
+
 func TestDKV_M1_WritesCallPropose(t *testing.T) {
 	sm := kvsm.New()
 	node := &mockRaftNode{leader: true}
