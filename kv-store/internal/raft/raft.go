@@ -47,16 +47,6 @@ type Config struct {
 	Rand   *rand.Rand // optional: for deterministic randomness in tests
 }
 
-// Status exposes internal state for debugging.
-type Status struct {
-	ID          types.NodeID     `json:"id"`
-	Role        string           `json:"role"`
-	Term        uint64           `json:"term"`
-	CommitIndex uint64           `json:"commit_index"`
-	LastApplied uint64           `json:"last_applied"`
-	LastIndex   uint64           `json:"last_index"`
-	LeaderHint  types.LeaderHint `json:"leader_hint"`
-}
 
 // Node is a Raft node.
 type Node struct {
@@ -166,11 +156,11 @@ func (n *Node) LeaderHint() types.LeaderHint {
 	return n.leaderHint
 }
 
-func (n *Node) Status() Status {
+func (n *Node) Status() types.NodeStatus {
 	n.mu.Lock()
 	defer n.mu.Unlock()
 	lastIdx, _ := n.log.LastIndex()
-	return Status{
+	return types.NodeStatus{
 		ID:          n.cfg.ID,
 		Role:        n.role,
 		Term:        n.currentTerm,
