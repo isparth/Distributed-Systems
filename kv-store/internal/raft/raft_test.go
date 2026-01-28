@@ -50,58 +50,84 @@ func makeNode(t *testing.T, id types.NodeID, peers []types.NodeID, tp transporth
 
 func TestRaft_M1_LeaderPropose_AppendsAndCommits(t *testing.T) {
 	ctx := context.Background()
+	ids := []types.NodeID{"n1", "n2", "n3"}
 
-	// Create nodes
-	n1, sm1 := makeNode(t, "n1", []types.NodeID{"n2", "n3"}, nil)
-	n2, sm2 := makeNode(t, "n2", []types.NodeID{"n1", "n3"}, nil)
-	n3, sm3 := makeNode(t, "n3", []types.NodeID{"n1", "n2"}, nil)
+	// Create placeholder nodes to get their HTTP handlers
+	nodes := make([]*Node, 3)
+	sms := make([]*kvsm.KVStateMachine, 3)
+	servers := make([]*httptest.Server, 3)
 
-	// Start n2 and n3 first
-	n2.Start(ctx)
-	n3.Start(ctx)
-	defer n2.Stop(ctx)
-	defer n3.Stop(ctx)
-
-	ts2 := httptest.NewServer(n2.RaftHTTPHandler().Handler())
-	ts3 := httptest.NewServer(n3.RaftHTTPHandler().Handler())
-	defer ts2.Close()
-	defer ts3.Close()
-
-	// Create transport for n1 with resolved peers
-	resolver := transporthttp.NewPeerResolver(map[types.NodeID]string{
-		"n2": ts2.URL,
-		"n3": ts3.URL,
-	})
-	tp := transporthttp.NewHTTPTransport(resolver)
-
-	// Recreate n1 with transport
-	sm1 = kvsm.New()
-	stable1 := storage.NewMemStableStore()
-	log1 := storage.NewMemLogStore()
-	snap1 := storage.NewMemSnapshotStore()
-	cfg1 := Config{
-		ID:     "n1",
-		Peers:  []types.NodeID{"n2", "n3"},
-		Addr:   "http://n1:8080",
-		Timing: fastTiming(),
+	for i, id := range ids {
+		peers := make([]types.NodeID, 0, 2)
+		for _, pid := range ids {
+			if pid != id {
+				peers = append(peers, pid)
+			}
+		}
+		nodes[i], sms[i] = makeNode(t, id, peers, nil)
+		servers[i] = httptest.NewServer(nodes[i].RaftHTTPHandler().Handler())
 	}
-	n1, _ = NewNode(cfg1, stable1, log1, snap1, tp, sm1)
-	n1.Start(ctx)
-	defer n1.Stop(ctx)
+	defer func() {
+		for _, s := range servers {
+			s.Close()
+		}
+	}()
 
-	// Wait for election - n1 should become leader eventually
-	time.Sleep(200 * time.Millisecond)
+	// Build peer map and recreate nodes with proper transports
+	peerMap := make(map[types.NodeID]string)
+	for i, id := range ids {
+		peerMap[id] = servers[i].URL
+	}
+
+	for i, id := range ids {
+		peers := make([]types.NodeID, 0, 2)
+		for _, pid := range ids {
+			if pid != id {
+				peers = append(peers, pid)
+			}
+		}
+		resolver := transporthttp.NewPeerResolver(peerMap)
+		tp := transporthttp.NewHTTPTransport(resolver)
+
+		sm := kvsm.New()
+		stable := storage.NewMemStableStore()
+		log := storage.NewMemLogStore()
+		snap := storage.NewMemSnapshotStore()
+		cfg := Config{
+			ID:     id,
+			Peers:  peers,
+			Addr:   servers[i].URL,
+			Timing: fastTiming(),
+		}
+		var err error
+		nodes[i], err = NewNode(cfg, stable, log, snap, tp, sm)
+		if err != nil {
+			t.Fatal(err)
+		}
+		sms[i] = sm
+		servers[i].Config.Handler = nodes[i].RaftHTTPHandler().Handler()
+	}
+
+	// Start all nodes
+	for _, n := range nodes {
+		n.Start(ctx)
+	}
+	defer func() {
+		for _, n := range nodes {
+			n.Stop(ctx)
+		}
+	}()
+
+	// Wait for election
+	time.Sleep(300 * time.Millisecond)
 
 	// Find the leader
 	var leader *Node
 	var leaderSM *kvsm.KVStateMachine
-	for _, pair := range []struct {
-		n  *Node
-		sm *kvsm.KVStateMachine
-	}{{n1, sm1}, {n2, sm2}, {n3, sm3}} {
-		if pair.n.IsLeader() {
-			leader = pair.n
-			leaderSM = pair.sm
+	for i, n := range nodes {
+		if n.IsLeader() {
+			leader = n
+			leaderSM = sms[i]
 			break
 		}
 	}
@@ -126,7 +152,7 @@ func TestRaft_M1_LeaderPropose_AppendsAndCommits(t *testing.T) {
 
 	// Wait for followers to apply
 	time.Sleep(100 * time.Millisecond)
-	for _, sm := range []*kvsm.KVStateMachine{sm1, sm2, sm3} {
+	for _, sm := range sms {
 		v, ok := sm.Get("hello")
 		if !ok || v != "world" {
 			t.Logf("sm: expected world, got %q ok=%v (may not be leader's SM)", v, ok)
