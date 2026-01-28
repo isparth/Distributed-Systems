@@ -30,16 +30,30 @@ type AppendEntriesResponse struct {
 	ConflictTerm  uint64 `json:"conflict_term,omitempty"`
 }
 
+type RequestVoteRequest struct {
+	Term         uint64       `json:"term"`
+	CandidateID  types.NodeID `json:"candidate_id"`
+	LastLogIndex uint64       `json:"last_log_index"`
+	LastLogTerm  uint64       `json:"last_log_term"`
+}
+
+type RequestVoteResponse struct {
+	Term        uint64 `json:"term"`
+	VoteGranted bool   `json:"vote_granted"`
+}
+
 // --- Interfaces ---
 
 // RaftRPCHandler is implemented by the Raft node to handle incoming RPCs.
 type RaftRPCHandler interface {
 	HandleAppendEntries(ctx context.Context, req AppendEntriesRequest) (AppendEntriesResponse, error)
+	HandleRequestVote(ctx context.Context, req RequestVoteRequest) (RequestVoteResponse, error)
 }
 
 // Transport is the interface the Raft node uses to send RPCs.
 type Transport interface {
 	AppendEntries(ctx context.Context, to types.NodeID, req AppendEntriesRequest) (AppendEntriesResponse, error)
+	RequestVote(ctx context.Context, to types.NodeID, req RequestVoteRequest) (RequestVoteResponse, error)
 }
 
 // --- PeerResolver ---
@@ -109,6 +123,40 @@ func (t *HTTPTransport) AppendEntries(ctx context.Context, to types.NodeID, req 
 	return result, nil
 }
 
+func (t *HTTPTransport) RequestVote(ctx context.Context, to types.NodeID, req RequestVoteRequest) (RequestVoteResponse, error) {
+	addr, err := t.resolver.Resolve(to)
+	if err != nil {
+		return RequestVoteResponse{}, err
+	}
+
+	body, err := json.Marshal(req)
+	if err != nil {
+		return RequestVoteResponse{}, err
+	}
+
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, addr+"/raft/request_vote", bytes.NewReader(body))
+	if err != nil {
+		return RequestVoteResponse{}, err
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+
+	resp, err := t.client.Do(httpReq)
+	if err != nil {
+		return RequestVoteResponse{}, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return RequestVoteResponse{}, fmt.Errorf("request_vote to %s returned %d", to, resp.StatusCode)
+	}
+
+	var result RequestVoteResponse
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return RequestVoteResponse{}, err
+	}
+	return result, nil
+}
+
 // --- RaftHTTPServer (server mux) ---
 
 type RaftHTTPServer struct {
@@ -122,6 +170,7 @@ func NewRaftHTTPServer(handler RaftRPCHandler) *RaftHTTPServer {
 func (s *RaftHTTPServer) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /raft/append_entries", s.handleAppendEntries)
+	mux.HandleFunc("POST /raft/request_vote", s.handleRequestVote)
 	return mux
 }
 
@@ -135,6 +184,27 @@ func (s *RaftHTTPServer) handleAppendEntries(w http.ResponseWriter, r *http.Requ
 	}
 
 	resp, err := s.handler.HandleAppendEntries(r.Context(), req)
+	if err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(resp)
+}
+
+func (s *RaftHTTPServer) handleRequestVote(w http.ResponseWriter, r *http.Request) {
+	var req RequestVoteRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(map[string]string{"error": "bad JSON"})
+		return
+	}
+
+	resp, err := s.handler.HandleRequestVote(r.Context(), req)
 	if err != nil {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusInternalServerError)
