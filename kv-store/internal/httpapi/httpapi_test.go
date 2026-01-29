@@ -28,6 +28,18 @@ func (m *mockNode) IsLeader() bool { return m.leader }
 
 func (m *mockNode) LeaderHint() types.LeaderHint { return m.leaderHint }
 
+func (m *mockNode) Status() types.NodeStatus {
+	role := "follower"
+	if m.leader {
+		role = "leader"
+	}
+	return types.NodeStatus{
+		ID:         "mock",
+		Role:       role,
+		LeaderHint: m.leaderHint,
+	}
+}
+
 func setupLeader() *httptest.Server {
 	sm := kvsm.New()
 	node := &mockNode{leader: true, sm: sm}

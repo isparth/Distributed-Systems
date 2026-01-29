@@ -23,6 +23,8 @@ func New(dkv *distributedkv.DistributedKV) *Server {
 func (s *Server) Handler() http.Handler {
 	r := chi.NewRouter()
 	r.Get("/healthz", s.Healthz)
+	r.Get("/status", s.Status)
+	r.Get("/kv", s.ListKeys)
 	r.Get("/kv/{key}", s.GetKey)
 	r.Put("/kv/{key}", s.PutKey)
 	r.Delete("/kv/{key}", s.DeleteKey)
@@ -34,6 +36,16 @@ func (s *Server) Handler() http.Handler {
 
 func (s *Server) Healthz(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+}
+
+func (s *Server) Status(w http.ResponseWriter, r *http.Request) {
+	status := s.dkv.Status()
+	writeJSON(w, http.StatusOK, status)
+}
+
+func (s *Server) ListKeys(w http.ResponseWriter, r *http.Request) {
+	all := s.dkv.All()
+	writeJSON(w, http.StatusOK, map[string]interface{}{"ok": true, "data": all})
 }
 
 func (s *Server) GetKey(w http.ResponseWriter, r *http.Request) {
