@@ -96,6 +96,109 @@ func TestMemLogStore_DeleteFrom(t *testing.T) {
 	}
 }
 
+// --- M3 Tests ---
+
+func TestMemLogStore_DeleteFrom_TruncatesSuffix(t *testing.T) {
+	s := NewMemLogStore()
+	entries := []LogEntry{
+		{Index: 1, Term: 1},
+		{Index: 2, Term: 1},
+		{Index: 3, Term: 2},
+		{Index: 4, Term: 2},
+		{Index: 5, Term: 3},
+	}
+	s.Append(entries)
+
+	// Delete from index 3 onwards (keep 1, 2)
+	if err := s.DeleteFrom(3); err != nil {
+		t.Fatal(err)
+	}
+
+	idx, _ := s.LastIndex()
+	if idx != 2 {
+		t.Fatalf("expected last index 2 after truncation, got %d", idx)
+	}
+
+	// Verify entries 1 and 2 still exist
+	term, err := s.TermAt(1)
+	if err != nil || term != 1 {
+		t.Fatalf("entry 1 should still exist with term 1, got term=%d err=%v", term, err)
+	}
+	term, err = s.TermAt(2)
+	if err != nil || term != 1 {
+		t.Fatalf("entry 2 should still exist with term 1, got term=%d err=%v", term, err)
+	}
+
+	// Verify entries 3-5 are gone
+	for i := uint64(3); i <= 5; i++ {
+		_, err := s.TermAt(i)
+		if err == nil {
+			t.Fatalf("entry %d should be deleted", i)
+		}
+	}
+
+	// Can append new entries after truncation
+	newEntries := []LogEntry{
+		{Index: 3, Term: 3},
+		{Index: 4, Term: 3},
+	}
+	if err := s.Append(newEntries); err != nil {
+		t.Fatal(err)
+	}
+	idx, _ = s.LastIndex()
+	if idx != 4 {
+		t.Fatalf("expected last index 4 after re-append, got %d", idx)
+	}
+	term, _ = s.TermAt(3)
+	if term != 3 {
+		t.Fatalf("new entry 3 should have term 3, got %d", term)
+	}
+}
+
+func TestMemLogStore_TermAt_ErrorsOnMissing(t *testing.T) {
+	s := NewMemLogStore()
+
+	// Empty log - index 1 should error
+	_, err := s.TermAt(1)
+	if err == nil {
+		t.Fatal("expected error for missing index 1 on empty log")
+	}
+
+	// Index 0 should always error (sentinel)
+	_, err = s.TermAt(0)
+	if err == nil {
+		t.Fatal("expected error for index 0")
+	}
+
+	// Add some entries
+	entries := []LogEntry{
+		{Index: 1, Term: 1},
+		{Index: 2, Term: 2},
+	}
+	s.Append(entries)
+
+	// Valid indices work
+	term, err := s.TermAt(1)
+	if err != nil || term != 1 {
+		t.Fatalf("expected term 1, got %d err=%v", term, err)
+	}
+	term, err = s.TermAt(2)
+	if err != nil || term != 2 {
+		t.Fatalf("expected term 2, got %d err=%v", term, err)
+	}
+
+	// Index beyond log should error
+	_, err = s.TermAt(3)
+	if err == nil {
+		t.Fatal("expected error for index 3 beyond log")
+	}
+
+	_, err = s.TermAt(100)
+	if err == nil {
+		t.Fatal("expected error for index 100 beyond log")
+	}
+}
+
 func TestMemStableStore_TermVote(t *testing.T) {
 	s := NewMemStableStore()
 
