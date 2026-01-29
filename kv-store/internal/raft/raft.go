@@ -374,6 +374,167 @@ func (n *Node) sendHeartbeats() {
 	}
 }
 
+// replicateToPeer sends AppendEntries to a peer and handles backtracking.
+// Returns (success, shouldRetry). shouldRetry is true if we should immediately retry with updated nextIndex.
+func (n *Node) replicateToPeer(ctx context.Context, peer types.NodeID) (success bool, matchIdx uint64) {
+	n.mu.Lock()
+	if n.role != RoleLeader {
+		n.mu.Unlock()
+		return false, 0
+	}
+	term := n.currentTerm
+	nextIdx := n.nextIndex[peer]
+	commitIndex := n.commitIndex
+
+	// Get prevLog info
+	prevLogIndex := nextIdx - 1
+	var prevLogTerm uint64
+	if prevLogIndex > 0 {
+		var err error
+		prevLogTerm, err = n.log.TermAt(prevLogIndex)
+		if err != nil {
+			// prevLogIndex is beyond our log - shouldn't happen normally
+			n.mu.Unlock()
+			return false, 0
+		}
+	}
+
+	// Get entries to send
+	lastIdx, _ := n.log.LastIndex()
+	var entries []storage.LogEntry
+	if nextIdx <= lastIdx {
+		var err error
+		entries, err = n.log.ReadRange(nextIdx, lastIdx)
+		if err != nil {
+			n.mu.Unlock()
+			return false, 0
+		}
+	}
+	n.mu.Unlock()
+
+	req := transporthttp.AppendEntriesRequest{
+		Term:         term,
+		LeaderID:     n.cfg.ID,
+		LeaderAddr:   n.cfg.Addr,
+		PrevLogIndex: prevLogIndex,
+		PrevLogTerm:  prevLogTerm,
+		Entries:      entries,
+		LeaderCommit: commitIndex,
+	}
+
+	if n.tp == nil {
+		return false, 0
+	}
+
+	resp, err := n.tp.AppendEntries(ctx, peer, req)
+	if err != nil {
+		return false, 0
+	}
+
+	n.mu.Lock()
+	defer n.mu.Unlock()
+
+	// Check if we're still leader for the same term
+	if n.role != RoleLeader || n.currentTerm != term {
+		return false, 0
+	}
+
+	if resp.Term > n.currentTerm {
+		// Step down - release lock first since stepDown also locks
+		n.mu.Unlock()
+		n.stepDown(resp.Term)
+		n.mu.Lock()
+		return false, 0
+	}
+
+	if resp.Success {
+		// Update matchIndex and nextIndex
+		newMatchIdx := prevLogIndex + uint64(len(entries))
+		if newMatchIdx > n.matchIndex[peer] {
+			n.matchIndex[peer] = newMatchIdx
+		}
+		n.nextIndex[peer] = newMatchIdx + 1
+		return true, newMatchIdx
+	}
+
+	// AppendEntries failed due to log inconsistency - backtrack nextIndex
+	if resp.ConflictTerm == 0 {
+		// Follower's log is too short
+		n.nextIndex[peer] = resp.ConflictIndex
+	} else {
+		// Find if we have any entries with the conflict term
+		found := false
+		for i := resp.ConflictIndex; i <= lastIdx; i++ {
+			t, err := n.log.TermAt(i)
+			if err != nil {
+				break
+			}
+			if t == resp.ConflictTerm {
+				// We have entries with this term - set nextIndex to after our last entry of this term
+				for j := i; j <= lastIdx; j++ {
+					t2, _ := n.log.TermAt(j)
+					if t2 != resp.ConflictTerm {
+						n.nextIndex[peer] = j
+						found = true
+						break
+					}
+				}
+				if !found {
+					n.nextIndex[peer] = lastIdx + 1
+					found = true
+				}
+				break
+			}
+		}
+		if !found {
+			// We don't have the conflict term - use the follower's first index of conflict term
+			n.nextIndex[peer] = resp.ConflictIndex
+		}
+	}
+
+	// Clamp nextIndex to at least 1
+	if n.nextIndex[peer] < 1 {
+		n.nextIndex[peer] = 1
+	}
+
+	return false, 0
+}
+
+// advanceCommitIndex checks if we can advance commitIndex based on matchIndex.
+// M3: Only commits entries from current term (Raft safety).
+func (n *Node) advanceCommitIndex() {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+
+	if n.role != RoleLeader {
+		return
+	}
+
+	lastIdx, _ := n.log.LastIndex()
+
+	// Try to advance commit index
+	for idx := n.commitIndex + 1; idx <= lastIdx; idx++ {
+		// M3 safety: Only commit entries from current term
+		term, err := n.log.TermAt(idx)
+		if err != nil || term != n.currentTerm {
+			continue
+		}
+
+		// Count replicas (including self)
+		replicaCount := 1
+		for _, peer := range n.cfg.Peers {
+			if n.matchIndex[peer] >= idx {
+				replicaCount++
+			}
+		}
+
+		majority := (len(n.cfg.Peers)+1)/2 + 1
+		if replicaCount >= majority {
+			n.commitIndex = idx
+		}
+	}
+}
+
 func (n *Node) stepDown(newTerm uint64) {
 	n.mu.Lock()
 	defer n.mu.Unlock()
@@ -412,15 +573,11 @@ func (n *Node) Propose(ctx context.Context, cmd types.Command) (types.ApplyResul
 		return types.ApplyResult{}, err
 	}
 
-	// Get prevLog info for AppendEntries
-	var prevLogTerm uint64
-	if lastIdx > 0 {
-		prevLogTerm, _ = n.log.TermAt(lastIdx)
-	}
+	// Update matchIndex for self
+	n.matchIndex[n.cfg.ID] = newIdx
 
 	peers := make([]types.NodeID, len(n.cfg.Peers))
 	copy(peers, n.cfg.Peers)
-	commitIndex := n.commitIndex
 	n.mu.Unlock()
 
 	// Register pending proposal
@@ -434,78 +591,112 @@ func (n *Node) Propose(ctx context.Context, cmd types.Command) (types.ApplyResul
 		n.pendingMu.Unlock()
 	}()
 
-	// Send AppendEntries to all peers
-	req := transporthttp.AppendEntriesRequest{
-		Term:         term,
-		LeaderID:     n.cfg.ID,
-		LeaderAddr:   n.cfg.Addr,
-		PrevLogIndex: lastIdx,
-		PrevLogTerm:  prevLogTerm,
-		Entries:      []storage.LogEntry{entry},
-		LeaderCommit: commitIndex,
-	}
-
-	successCount := 1 // count self
-	majority := (len(peers)+1)/2 + 1
-
+	// Replicate to all peers with retries for backtracking
 	type peerResult struct {
-		resp transporthttp.AppendEntriesResponse
-		err  error
+		peer     types.NodeID
+		success  bool
+		matchIdx uint64
 	}
 	results := make(chan peerResult, len(peers))
 
 	for _, p := range peers {
 		go func(peer types.NodeID) {
-			if n.tp == nil {
-				results <- peerResult{err: fmt.Errorf("no transport")}
-				return
+			// Retry loop for log repair
+			for attempt := 0; attempt < 10; attempt++ {
+				select {
+				case <-ctx.Done():
+					results <- peerResult{peer: peer, success: false}
+					return
+				default:
+				}
+
+				success, matchIdx := n.replicateToPeer(ctx, peer)
+				if success {
+					results <- peerResult{peer: peer, success: true, matchIdx: matchIdx}
+					return
+				}
+
+				// Check if we're still leader
+				n.mu.Lock()
+				stillLeader := n.role == RoleLeader && n.currentTerm == term
+				n.mu.Unlock()
+				if !stillLeader {
+					results <- peerResult{peer: peer, success: false}
+					return
+				}
+
+				// Small delay before retry
+				select {
+				case <-ctx.Done():
+					results <- peerResult{peer: peer, success: false}
+					return
+				case <-time.After(10 * time.Millisecond):
+				}
 			}
-			resp, err := n.tp.AppendEntries(ctx, peer, req)
-			results <- peerResult{resp, err}
+			results <- peerResult{peer: peer, success: false}
 		}(p)
 	}
 
+	// Collect results
+	successCount := 1 // count self
+	majority := (len(peers)+1)/2 + 1
+
 	for range peers {
-		pr := <-results
-		if pr.err == nil && pr.resp.Success {
-			successCount++
-		}
-		if pr.err == nil && pr.resp.Term > term {
-			n.stepDown(pr.resp.Term)
-			return types.ApplyResult{}, ErrNotLeader
+		select {
+		case pr := <-results:
+			if pr.success {
+				successCount++
+			}
+		case <-ctx.Done():
+			return types.ApplyResult{}, ctx.Err()
 		}
 	}
+
+	// Check if still leader
+	n.mu.Lock()
+	if n.role != RoleLeader || n.currentTerm != term {
+		n.mu.Unlock()
+		return types.ApplyResult{}, ErrNotLeader
+	}
+	n.mu.Unlock()
 
 	if successCount < majority {
 		return types.ApplyResult{}, fmt.Errorf("failed to replicate to majority: %d/%d", successCount, majority)
 	}
 
-	// Advance commitIndex
-	n.mu.Lock()
-	if n.role != RoleLeader {
-		n.mu.Unlock()
-		return types.ApplyResult{}, ErrNotLeader
-	}
-	if newIdx > n.commitIndex {
-		n.commitIndex = newIdx
-	}
-	n.mu.Unlock()
+	// Advance commitIndex using proper commit rule
+	n.advanceCommitIndex()
 
 	// Signal applier
 	n.signalApplier()
 
-	// Notify followers of new commitIndex (empty AppendEntries as heartbeat)
-	commitNotify := transporthttp.AppendEntriesRequest{
-		Term:         term,
-		LeaderID:     n.cfg.ID,
-		LeaderAddr:   n.cfg.Addr,
-		PrevLogIndex: newIdx,
-		PrevLogTerm:  term,
-		LeaderCommit: newIdx,
-	}
+	// Notify followers of new commitIndex
+	n.mu.Lock()
+	commitIndex := n.commitIndex
+	n.mu.Unlock()
+
 	for _, p := range peers {
 		if n.tp != nil {
-			go n.tp.AppendEntries(ctx, p, commitNotify)
+			go func(peer types.NodeID) {
+				n.mu.Lock()
+				nextIdx := n.nextIndex[peer]
+				prevIdx := nextIdx - 1
+				var prevTerm uint64
+				if prevIdx > 0 {
+					prevTerm, _ = n.log.TermAt(prevIdx)
+				}
+				n.mu.Unlock()
+
+				commitNotify := transporthttp.AppendEntriesRequest{
+					Term:         term,
+					LeaderID:     n.cfg.ID,
+					LeaderAddr:   n.cfg.Addr,
+					PrevLogIndex: prevIdx,
+					PrevLogTerm:  prevTerm,
+					LeaderCommit: commitIndex,
+				}
+				n.tp.AppendEntries(ctx, peer, commitNotify)
+			}(p)
 		}
 	}
 
@@ -551,10 +742,79 @@ func (n *Node) HandleAppendEntries(ctx context.Context, req transporthttp.Append
 		n.role = RoleFollower
 	}
 
-	// Append entries (no conflict checking in M1/M2)
+	// M3: Log consistency check
+	// Check that prevLogIndex entry exists and has matching term
+	if req.PrevLogIndex > 0 {
+		lastIdx, _ := n.log.LastIndex()
+		if req.PrevLogIndex > lastIdx {
+			// We don't have the entry at prevLogIndex
+			return transporthttp.AppendEntriesResponse{
+				Term:          n.currentTerm,
+				Success:       false,
+				ConflictIndex: lastIdx + 1,
+				ConflictTerm:  0,
+			}, nil
+		}
+
+		prevTerm, err := n.log.TermAt(req.PrevLogIndex)
+		if err != nil {
+			// Entry doesn't exist (shouldn't happen if lastIdx check passed)
+			return transporthttp.AppendEntriesResponse{
+				Term:          n.currentTerm,
+				Success:       false,
+				ConflictIndex: req.PrevLogIndex,
+				ConflictTerm:  0,
+			}, nil
+		}
+
+		if prevTerm != req.PrevLogTerm {
+			// Term mismatch - find the first index of the conflicting term
+			conflictTerm := prevTerm
+			conflictIndex := req.PrevLogIndex
+			// Walk backwards to find first entry with this term
+			for conflictIndex > 1 {
+				t, err := n.log.TermAt(conflictIndex - 1)
+				if err != nil || t != conflictTerm {
+					break
+				}
+				conflictIndex--
+			}
+			return transporthttp.AppendEntriesResponse{
+				Term:          n.currentTerm,
+				Success:       false,
+				ConflictIndex: conflictIndex,
+				ConflictTerm:  conflictTerm,
+			}, nil
+		}
+	}
+
+	// Append entries - check for conflicts and truncate if needed
 	if len(req.Entries) > 0 {
-		if err := n.log.Append(req.Entries); err != nil {
-			return transporthttp.AppendEntriesResponse{Term: n.currentTerm, Success: false}, nil
+		lastIdx, _ := n.log.LastIndex()
+
+		for i, entry := range req.Entries {
+			if entry.Index <= lastIdx {
+				// Entry already exists - check if terms match
+				existingTerm, err := n.log.TermAt(entry.Index)
+				if err == nil && existingTerm != entry.Term {
+					// Conflict! Delete this entry and everything after
+					if err := n.log.DeleteFrom(entry.Index); err != nil {
+						return transporthttp.AppendEntriesResponse{Term: n.currentTerm, Success: false}, nil
+					}
+					// Append remaining entries from this point
+					if err := n.log.Append(req.Entries[i:]); err != nil {
+						return transporthttp.AppendEntriesResponse{Term: n.currentTerm, Success: false}, nil
+					}
+					break
+				}
+				// Terms match - skip this entry, it's already correct
+			} else {
+				// Entry doesn't exist - append this and all remaining entries
+				if err := n.log.Append(req.Entries[i:]); err != nil {
+					return transporthttp.AppendEntriesResponse{Term: n.currentTerm, Success: false}, nil
+				}
+				break
+			}
 		}
 	}
 
