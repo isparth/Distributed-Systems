@@ -180,3 +180,85 @@ func TestKVSM_SnapshotRestore_RoundTrip(t *testing.T) {
 		t.Fatalf("dedupe not restored: seq=%d ok=%v", seq, ok)
 	}
 }
+
+// --- M5 Tests ---
+
+func TestKVSM_M5_SnapshotIncludesDedupe(t *testing.T) {
+	sm := New()
+
+	// Apply commands with client IDs for deduplication
+	sm.Apply(types.Command{ClientID: "client1", Seq: 1, Op: types.OpPut, Key: "a", Value: "1"})
+	sm.Apply(types.Command{ClientID: "client1", Seq: 2, Op: types.OpPut, Key: "b", Value: "2"})
+	sm.Apply(types.Command{ClientID: "client2", Seq: 1, Op: types.OpPut, Key: "c", Value: "3"})
+
+	data, err := sm.Snapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Verify snapshot contains dedupe records
+	var snap Snapshot
+	if err := json.Unmarshal(data, &snap); err != nil {
+		t.Fatal(err)
+	}
+
+	if len(snap.Dedupe) != 2 {
+		t.Fatalf("expected 2 dedupe records, got %d", len(snap.Dedupe))
+	}
+
+	if snap.Dedupe["client1"].LastSeq != 2 {
+		t.Fatalf("expected client1 last seq 2, got %d", snap.Dedupe["client1"].LastSeq)
+	}
+	if snap.Dedupe["client2"].LastSeq != 1 {
+		t.Fatalf("expected client2 last seq 1, got %d", snap.Dedupe["client2"].LastSeq)
+	}
+}
+
+func TestKVSM_M5_RestoreResetsStateCorrectly(t *testing.T) {
+	// Create first state machine with some data
+	sm1 := New()
+	sm1.Apply(types.Command{ClientID: "c1", Seq: 1, Op: types.OpPut, Key: "old", Value: "data"})
+	sm1.Apply(types.Command{ClientID: "c1", Seq: 2, Op: types.OpPut, Key: "more", Value: "stuff"})
+
+	// Create second state machine with different data
+	sm2 := New()
+	sm2.Apply(types.Command{ClientID: "c2", Seq: 5, Op: types.OpPut, Key: "new", Value: "values"})
+
+	// Snapshot sm2
+	data, err := sm2.Snapshot()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Restore sm2's snapshot into sm1
+	if err := sm1.Restore(data); err != nil {
+		t.Fatal(err)
+	}
+
+	// Verify old data is gone
+	_, ok := sm1.Get("old")
+	if ok {
+		t.Fatal("old key should be gone after restore")
+	}
+	_, ok = sm1.Get("more")
+	if ok {
+		t.Fatal("more key should be gone after restore")
+	}
+
+	// Verify new data is present
+	v, ok := sm1.Get("new")
+	if !ok || v != "values" {
+		t.Fatalf("expected new=values, got %q ok=%v", v, ok)
+	}
+
+	// Verify dedupe was reset
+	_, ok = sm1.LastSeen("c1")
+	if ok {
+		t.Fatal("c1 dedupe should be gone after restore")
+	}
+
+	seq, ok := sm1.LastSeen("c2")
+	if !ok || seq != 5 {
+		t.Fatalf("c2 dedupe should be restored: seq=%d ok=%v", seq, ok)
+	}
+}
