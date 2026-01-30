@@ -2,6 +2,7 @@ package raft
 
 import (
 	"context"
+	"encoding/base64"
 	"errors"
 	"fmt"
 	"math/rand"
@@ -21,6 +22,7 @@ const (
 )
 
 var ErrNotLeader = errors.New("not leader")
+var ErrTimeout = errors.New("timeout waiting for apply")
 
 // TimingConfig holds configurable timing parameters for elections and heartbeats.
 type TimingConfig struct {
@@ -45,6 +47,10 @@ type Config struct {
 	Addr   string         // this node's advertised address
 	Timing TimingConfig
 	Rand   *rand.Rand // optional: for deterministic randomness in tests
+
+	// M5: Snapshot configuration
+	SnapshotThreshold     uint64        // Entries before snapshot (default: 1000)
+	SnapshotCheckInterval time.Duration // How often to check for snapshot (default: 1s)
 }
 
 
@@ -67,6 +73,10 @@ type Node struct {
 
 	matchIndex map[types.NodeID]uint64
 	nextIndex  map[types.NodeID]uint64
+
+	// M5: snapshot state
+	lastSnapshotIndex uint64
+	lastSnapshotTerm  uint64
 
 	// timers and goroutines
 	applierDone      chan struct{}
@@ -125,6 +135,25 @@ func NewNode(cfg Config, stable storage.StableStore, log storage.LogStore, snap 
 		rand:            r,
 	}
 
+	// M5: Restore from snapshot if available
+	if meta, data, ok, err := snap.Load(); err == nil && ok {
+		// Restore state machine
+		if err := sm.Restore(data); err != nil {
+			return nil, fmt.Errorf("failed to restore state machine from snapshot: %w", err)
+		}
+		n.lastSnapshotIndex = meta.LastIncludedIndex
+		n.lastSnapshotTerm = meta.LastIncludedTerm
+		n.lastApplied = meta.LastIncludedIndex
+		n.commitIndex = meta.LastIncludedIndex
+
+		// Set log base if needed
+		if memLog, ok := log.(*storage.MemLogStore); ok {
+			if memLog.BaseIndex() == 0 {
+				memLog.SetBase(meta.LastIncludedIndex, meta.LastIncludedTerm)
+			}
+		}
+	}
+
 	return n, nil
 }
 
@@ -168,6 +197,129 @@ func (n *Node) Status() types.NodeStatus {
 		LastApplied: n.lastApplied,
 		LastIndex:   lastIdx,
 		LeaderHint:  n.leaderHint,
+	}
+}
+
+// GetReadIndex returns the current commit index if this node is the leader.
+// For ReadIndex reads, the client should wait until this index is applied
+// before reading from the state machine.
+// M4: This confirms leadership via a quorum check (heartbeat round).
+func (n *Node) GetReadIndex(ctx context.Context) (uint64, error) {
+	n.mu.Lock()
+	if n.role != RoleLeader {
+		n.mu.Unlock()
+		return 0, ErrNotLeader
+	}
+	term := n.currentTerm
+	commitIndex := n.commitIndex
+	peers := make([]types.NodeID, len(n.cfg.Peers))
+	copy(peers, n.cfg.Peers)
+	n.mu.Unlock()
+
+	// Confirm leadership by getting a quorum of heartbeat responses
+	// This ensures we're still the leader and our commitIndex is valid
+	if len(peers) == 0 {
+		// Single node cluster - we're always the leader
+		return commitIndex, nil
+	}
+
+	type heartbeatResult struct {
+		success bool
+	}
+	results := make(chan heartbeatResult, len(peers))
+
+	for _, p := range peers {
+		go func(peer types.NodeID) {
+			if n.tp == nil {
+				results <- heartbeatResult{success: false}
+				return
+			}
+
+			n.mu.Lock()
+			nextIdx := n.nextIndex[peer]
+			prevIdx := nextIdx - 1
+			var prevTerm uint64
+			if prevIdx > 0 {
+				prevTerm, _ = n.log.TermAt(prevIdx)
+			}
+			n.mu.Unlock()
+
+			req := transporthttp.AppendEntriesRequest{
+				Term:         term,
+				LeaderID:     n.cfg.ID,
+				LeaderAddr:   n.cfg.Addr,
+				PrevLogIndex: prevIdx,
+				PrevLogTerm:  prevTerm,
+				LeaderCommit: commitIndex,
+			}
+
+			resp, err := n.tp.AppendEntries(ctx, peer, req)
+			if err != nil {
+				results <- heartbeatResult{success: false}
+				return
+			}
+
+			if resp.Term > term {
+				n.stepDown(resp.Term)
+				results <- heartbeatResult{success: false}
+				return
+			}
+
+			results <- heartbeatResult{success: resp.Success || resp.Term == term}
+		}(p)
+	}
+
+	// Count successes (including self)
+	successCount := 1 // self
+	majority := (len(peers)+1)/2 + 1
+
+	for range peers {
+		select {
+		case r := <-results:
+			if r.success {
+				successCount++
+			}
+		case <-ctx.Done():
+			return 0, ctx.Err()
+		}
+	}
+
+	// Check we're still leader
+	n.mu.Lock()
+	if n.role != RoleLeader || n.currentTerm != term {
+		n.mu.Unlock()
+		return 0, ErrNotLeader
+	}
+	readIndex := n.commitIndex
+	n.mu.Unlock()
+
+	if successCount < majority {
+		return 0, ErrNotLeader
+	}
+
+	return readIndex, nil
+}
+
+// WaitApplied blocks until the given index has been applied to the state machine.
+// M4: Used for ReadIndex reads to ensure consistency.
+func (n *Node) WaitApplied(ctx context.Context, index uint64) error {
+	ticker := time.NewTicker(5 * time.Millisecond)
+	defer ticker.Stop()
+
+	for {
+		n.mu.Lock()
+		if n.lastApplied >= index {
+			n.mu.Unlock()
+			return nil
+		}
+		n.mu.Unlock()
+
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-ticker.C:
+			// Check again
+		}
 	}
 }
 
@@ -386,6 +538,14 @@ func (n *Node) replicateToPeer(ctx context.Context, peer types.NodeID) (success 
 	nextIdx := n.nextIndex[peer]
 	commitIndex := n.commitIndex
 
+	// M5: Check if we need to send a snapshot instead
+	baseIndex := n.log.BaseIndex()
+	if baseIndex > 0 && nextIdx <= baseIndex {
+		// Follower is too far behind - need to send snapshot
+		n.mu.Unlock()
+		return n.sendSnapshotToPeer(ctx, peer)
+	}
+
 	// Get prevLog info
 	prevLogIndex := nextIdx - 1
 	var prevLogTerm uint64
@@ -393,7 +553,12 @@ func (n *Node) replicateToPeer(ctx context.Context, peer types.NodeID) (success 
 		var err error
 		prevLogTerm, err = n.log.TermAt(prevLogIndex)
 		if err != nil {
-			// prevLogIndex is beyond our log - shouldn't happen normally
+			// prevLogIndex is beyond our log or truncated - may need snapshot
+			// Check if it's due to truncation
+			if baseIndex > 0 && prevLogIndex <= baseIndex {
+				n.mu.Unlock()
+				return n.sendSnapshotToPeer(ctx, peer)
+			}
 			n.mu.Unlock()
 			return false, 0
 		}
@@ -498,6 +663,65 @@ func (n *Node) replicateToPeer(ctx context.Context, peer types.NodeID) (success 
 	}
 
 	return false, 0
+}
+
+// M5: sendSnapshotToPeer sends a snapshot to a lagging peer.
+func (n *Node) sendSnapshotToPeer(ctx context.Context, peer types.NodeID) (success bool, matchIdx uint64) {
+	// Load snapshot
+	meta, data, ok, err := n.snap.Load()
+	if err != nil || !ok {
+		return false, 0
+	}
+
+	n.mu.Lock()
+	if n.role != RoleLeader {
+		n.mu.Unlock()
+		return false, 0
+	}
+	term := n.currentTerm
+	n.mu.Unlock()
+
+	// Encode data as base64
+	encodedData := base64.StdEncoding.EncodeToString(data)
+
+	req := transporthttp.InstallSnapshotRequest{
+		Term:              term,
+		LeaderID:          n.cfg.ID,
+		LeaderAddr:        n.cfg.Addr,
+		LastIncludedIndex: meta.LastIncludedIndex,
+		LastIncludedTerm:  meta.LastIncludedTerm,
+		Data:              encodedData,
+	}
+
+	if n.tp == nil {
+		return false, 0
+	}
+
+	resp, err := n.tp.InstallSnapshot(ctx, peer, req)
+	if err != nil {
+		return false, 0
+	}
+
+	n.mu.Lock()
+	defer n.mu.Unlock()
+
+	// Check if we're still leader
+	if n.role != RoleLeader || n.currentTerm != term {
+		return false, 0
+	}
+
+	if resp.Term > n.currentTerm {
+		n.mu.Unlock()
+		n.stepDown(resp.Term)
+		n.mu.Lock()
+		return false, 0
+	}
+
+	// Success - update nextIndex and matchIndex
+	n.nextIndex[peer] = meta.LastIncludedIndex + 1
+	n.matchIndex[peer] = meta.LastIncludedIndex
+
+	return true, meta.LastIncludedIndex
 }
 
 // advanceCommitIndex checks if we can advance commitIndex based on matchIndex.
@@ -913,6 +1137,20 @@ func (n *Node) applyPending() {
 		}
 		lo := n.lastApplied + 1
 		hi := n.commitIndex
+
+		// M5: Handle case where log has been truncated
+		// If lo is <= baseIndex, we need to skip to first available entry
+		baseIndex := n.log.BaseIndex()
+		if baseIndex > 0 && lo <= baseIndex {
+			// Skip to first entry after base
+			lo = baseIndex + 1
+			if lo > hi {
+				// Nothing to apply
+				n.lastApplied = hi
+				n.mu.Unlock()
+				return
+			}
+		}
 		n.mu.Unlock()
 
 		entries, err := n.log.ReadRange(lo, hi)
@@ -940,4 +1178,163 @@ func (n *Node) applyPending() {
 // RaftHTTPHandler returns the Raft RPC HTTP handler for this node.
 func (n *Node) RaftHTTPHandler() *transporthttp.RaftHTTPServer {
 	return transporthttp.NewRaftHTTPServer(n)
+}
+
+// --- M5: Snapshot Methods ---
+
+// CreateSnapshot creates a snapshot at the given index.
+// The index must be <= lastApplied (i.e., already applied to state machine).
+func (n *Node) CreateSnapshot(lastIncludedIndex uint64) error {
+	n.mu.Lock()
+	if lastIncludedIndex > n.lastApplied {
+		n.mu.Unlock()
+		return fmt.Errorf("cannot snapshot index %d: lastApplied is %d", lastIncludedIndex, n.lastApplied)
+	}
+	if lastIncludedIndex <= n.lastSnapshotIndex {
+		n.mu.Unlock()
+		return nil // Already snapshotted past this point
+	}
+	n.mu.Unlock()
+
+	// Get term at snapshot point
+	term, err := n.log.TermAt(lastIncludedIndex)
+	if err != nil {
+		return fmt.Errorf("cannot get term at index %d: %w", lastIncludedIndex, err)
+	}
+
+	// Serialize state machine
+	data, err := n.sm.Snapshot()
+	if err != nil {
+		return fmt.Errorf("cannot snapshot state machine: %w", err)
+	}
+
+	// Save snapshot
+	meta := storage.SnapshotMeta{
+		LastIncludedIndex: lastIncludedIndex,
+		LastIncludedTerm:  term,
+	}
+	if err := n.snap.Save(meta, data); err != nil {
+		return fmt.Errorf("cannot save snapshot: %w", err)
+	}
+
+	// Truncate log prefix
+	if err := n.log.TruncatePrefix(lastIncludedIndex); err != nil {
+		return fmt.Errorf("cannot truncate log prefix: %w", err)
+	}
+
+	// Update snapshot state
+	n.mu.Lock()
+	n.lastSnapshotIndex = lastIncludedIndex
+	n.lastSnapshotTerm = term
+	n.mu.Unlock()
+
+	return nil
+}
+
+// MaybeSnapshot creates a snapshot if enough entries have accumulated.
+func (n *Node) MaybeSnapshot() error {
+	threshold := n.cfg.SnapshotThreshold
+	if threshold == 0 {
+		threshold = 1000 // default
+	}
+
+	n.mu.Lock()
+	lastApplied := n.lastApplied
+	lastSnapshotIndex := n.lastSnapshotIndex
+	n.mu.Unlock()
+
+	if lastApplied-lastSnapshotIndex < threshold {
+		return nil // Not enough entries
+	}
+
+	return n.CreateSnapshot(lastApplied)
+}
+
+// HandleInstallSnapshot handles an incoming InstallSnapshot RPC from the leader.
+func (n *Node) HandleInstallSnapshot(ctx context.Context, req transporthttp.InstallSnapshotRequest) (transporthttp.InstallSnapshotResponse, error) {
+	n.mu.Lock()
+
+	// Step down if higher term
+	if req.Term > n.currentTerm {
+		n.currentTerm = req.Term
+		n.stable.SetCurrentTerm(req.Term)
+		n.votedFor = ""
+		if n.role == RoleLeader && n.heartbeatStopCh != nil {
+			close(n.heartbeatStopCh)
+			n.heartbeatStopCh = nil
+		}
+		n.role = RoleFollower
+	}
+
+	// Reject if our term is higher
+	if req.Term < n.currentTerm {
+		term := n.currentTerm
+		n.mu.Unlock()
+		return transporthttp.InstallSnapshotResponse{Term: term}, nil
+	}
+
+	// Reset election timer - we heard from the leader
+	n.resetElectionTimer()
+
+	// Update leader hint
+	n.leaderHint = types.LeaderHint{LeaderID: req.LeaderID, LeaderAddr: req.LeaderAddr}
+
+	// If we're candidate, step down
+	if n.role == RoleCandidate {
+		n.role = RoleFollower
+	}
+
+	// Skip if we already have this snapshot or a newer one
+	if req.LastIncludedIndex <= n.lastSnapshotIndex {
+		term := n.currentTerm
+		n.mu.Unlock()
+		return transporthttp.InstallSnapshotResponse{Term: term}, nil
+	}
+
+	term := n.currentTerm
+	n.mu.Unlock()
+
+	// Decode base64 snapshot data
+	data, err := base64.StdEncoding.DecodeString(req.Data)
+	if err != nil {
+		return transporthttp.InstallSnapshotResponse{Term: term}, fmt.Errorf("invalid base64 data: %w", err)
+	}
+
+	// Restore state machine
+	if err := n.sm.Restore(data); err != nil {
+		return transporthttp.InstallSnapshotResponse{Term: term}, fmt.Errorf("failed to restore state machine: %w", err)
+	}
+
+	// Save snapshot to store
+	meta := storage.SnapshotMeta{
+		LastIncludedIndex: req.LastIncludedIndex,
+		LastIncludedTerm:  req.LastIncludedTerm,
+	}
+	if err := n.snap.Save(meta, data); err != nil {
+		return transporthttp.InstallSnapshotResponse{Term: term}, fmt.Errorf("failed to save snapshot: %w", err)
+	}
+
+	// Update log - discard all entries and set new base
+	// Use type assertion to access SetBase method on concrete type
+	if memLog, ok := n.log.(*storage.MemLogStore); ok {
+		memLog.SetBase(req.LastIncludedIndex, req.LastIncludedTerm)
+	} else {
+		// For other implementations, truncate prefix
+		n.log.TruncatePrefix(req.LastIncludedIndex)
+	}
+
+	// Update state
+	n.mu.Lock()
+	n.lastSnapshotIndex = req.LastIncludedIndex
+	n.lastSnapshotTerm = req.LastIncludedTerm
+	// Update lastApplied and commitIndex if the snapshot is ahead
+	if req.LastIncludedIndex > n.lastApplied {
+		n.lastApplied = req.LastIncludedIndex
+	}
+	if req.LastIncludedIndex > n.commitIndex {
+		n.commitIndex = req.LastIncludedIndex
+	}
+	n.mu.Unlock()
+
+	return transporthttp.InstallSnapshotResponse{Term: term}, nil
 }

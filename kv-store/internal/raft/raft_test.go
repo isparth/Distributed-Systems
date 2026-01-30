@@ -3,6 +3,7 @@ package raft
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"math/rand"
@@ -1129,5 +1130,574 @@ func TestRaft_M3_CommittedEntriesNotLostAfterLeaderChange(t *testing.T) {
 	v, ok := sms[newLeaderIdx].Get("key4")
 	if !ok || v != "value4" {
 		t.Fatalf("new leader missing key4: got %q, want value4", v)
+	}
+}
+
+// --- M4 Tests: ReadIndex Reads ---
+
+func TestRaft_M4_WaitAppliedBlocksUntilApplied(t *testing.T) {
+	ctx := context.Background()
+	node, sm := makeNode(t, "n1", nil, nil)
+	node.Start(ctx)
+	defer node.Stop(ctx)
+
+	// Manually append an entry and set commitIndex
+	node.mu.Lock()
+	node.log.Append([]storage.LogEntry{
+		{Index: 1, Term: 1, Cmd: types.Command{Op: types.OpPut, Key: "k1", Value: "v1"}},
+	})
+	node.currentTerm = 1
+	node.commitIndex = 1
+	node.mu.Unlock()
+
+	// Signal applier
+	node.signalApplier()
+
+	// WaitApplied should return after the entry is applied
+	waitCtx, cancel := context.WithTimeout(ctx, 500*time.Millisecond)
+	defer cancel()
+
+	err := node.WaitApplied(waitCtx, 1)
+	if err != nil {
+		t.Fatalf("WaitApplied failed: %v", err)
+	}
+
+	// Verify the entry was applied
+	v, ok := sm.Get("k1")
+	if !ok || v != "v1" {
+		t.Fatalf("expected v1, got %q ok=%v", v, ok)
+	}
+}
+
+func TestRaft_M4_WaitAppliedTimesOut(t *testing.T) {
+	ctx := context.Background()
+	node, _ := makeNode(t, "n1", nil, nil)
+	node.Start(ctx)
+	defer node.Stop(ctx)
+
+	// Don't append or commit any entries
+	// WaitApplied for index 1 should timeout
+
+	waitCtx, cancel := context.WithTimeout(ctx, 50*time.Millisecond)
+	defer cancel()
+
+	err := node.WaitApplied(waitCtx, 1)
+	if err == nil {
+		t.Fatal("expected timeout error")
+	}
+	if err != context.DeadlineExceeded {
+		t.Fatalf("expected DeadlineExceeded, got %v", err)
+	}
+}
+
+func TestRaft_M4_GetReadIndex_ReturnsCommitIndex(t *testing.T) {
+	ctx := context.Background()
+	ids := []types.NodeID{"n1", "n2", "n3"}
+
+	nodes := make([]*Node, 3)
+	servers := make([]*httptest.Server, 3)
+
+	// Create servers
+	for i := range servers {
+		mux := http.NewServeMux()
+		servers[i] = httptest.NewServer(mux)
+	}
+	defer func() {
+		for _, s := range servers {
+			s.Close()
+		}
+	}()
+
+	peerMap := make(map[types.NodeID]string)
+	for i, id := range ids {
+		peerMap[id] = servers[i].URL
+	}
+
+	// Create nodes
+	for i, id := range ids {
+		peers := make([]types.NodeID, 0, 2)
+		for _, pid := range ids {
+			if pid != id {
+				peers = append(peers, pid)
+			}
+		}
+		resolver := transporthttp.NewPeerResolver(peerMap)
+		tp := transporthttp.NewHTTPTransport(resolver)
+
+		sm := kvsm.New()
+		stable := storage.NewMemStableStore()
+		logStore := storage.NewMemLogStore()
+		snap := storage.NewMemSnapshotStore()
+		cfg := Config{
+			ID:     id,
+			Peers:  peers,
+			Addr:   servers[i].URL,
+			Timing: fastTiming(),
+		}
+		var err error
+		nodes[i], err = NewNode(cfg, stable, logStore, snap, tp, sm)
+		if err != nil {
+			t.Fatal(err)
+		}
+		servers[i].Config.Handler = nodes[i].RaftHTTPHandler().Handler()
+		nodes[i].Start(ctx)
+	}
+	defer func() {
+		for _, n := range nodes {
+			n.Stop(ctx)
+		}
+	}()
+
+	// Wait for leader election
+	time.Sleep(300 * time.Millisecond)
+
+	var leaderIdx int = -1
+	for i, n := range nodes {
+		if n.IsLeader() {
+			leaderIdx = i
+			break
+		}
+	}
+	if leaderIdx == -1 {
+		t.Fatal("no leader elected")
+	}
+
+	// Write some entries to advance commit index
+	cmd := types.Command{ClientID: "c1", Seq: 1, Op: types.OpPut, Key: "k1", Value: "v1"}
+	_, err := nodes[leaderIdx].Propose(ctx, cmd)
+	if err != nil {
+		t.Fatalf("propose failed: %v", err)
+	}
+
+	// GetReadIndex should return the commit index
+	readCtx, cancel := context.WithTimeout(ctx, 500*time.Millisecond)
+	defer cancel()
+
+	readIndex, err := nodes[leaderIdx].GetReadIndex(readCtx)
+	if err != nil {
+		t.Fatalf("GetReadIndex failed: %v", err)
+	}
+
+	// ReadIndex should be >= 1 (since we committed entry at index 1)
+	if readIndex < 1 {
+		t.Fatalf("expected readIndex >= 1, got %d", readIndex)
+	}
+
+	nodes[leaderIdx].mu.Lock()
+	commitIndex := nodes[leaderIdx].commitIndex
+	nodes[leaderIdx].mu.Unlock()
+
+	if readIndex != commitIndex {
+		t.Fatalf("expected readIndex=%d, got %d", commitIndex, readIndex)
+	}
+}
+
+func TestRaft_M4_GetReadIndex_FailsOnFollower(t *testing.T) {
+	ctx := context.Background()
+	node, _ := makeNode(t, "n1", []types.NodeID{"n2"}, nil)
+	node.Start(ctx)
+	defer node.Stop(ctx)
+
+	// Node is a follower (never elected)
+	readCtx, cancel := context.WithTimeout(ctx, 50*time.Millisecond)
+	defer cancel()
+
+	_, err := node.GetReadIndex(readCtx)
+	if err != ErrNotLeader {
+		t.Fatalf("expected ErrNotLeader, got %v", err)
+	}
+}
+
+func TestRaft_M4_GetReadIndex_SingleNodeCluster(t *testing.T) {
+	ctx := context.Background()
+	node, _ := makeNode(t, "n1", nil, nil)
+	node.Start(ctx)
+	defer node.Stop(ctx)
+
+	// Force node to be leader (single node)
+	node.mu.Lock()
+	node.role = RoleLeader
+	node.currentTerm = 1
+	node.commitIndex = 5
+	node.mu.Unlock()
+
+	readCtx, cancel := context.WithTimeout(ctx, 50*time.Millisecond)
+	defer cancel()
+
+	readIndex, err := node.GetReadIndex(readCtx)
+	if err != nil {
+		t.Fatalf("GetReadIndex failed: %v", err)
+	}
+	if readIndex != 5 {
+		t.Fatalf("expected readIndex=5, got %d", readIndex)
+	}
+}
+
+// --- M5 Tests: Snapshots ---
+
+func TestRaft_M5_CreateSnapshot_TruncatesLogPrefix(t *testing.T) {
+	ctx := context.Background()
+	node, sm := makeNode(t, "n1", nil, nil)
+	node.Start(ctx)
+	defer node.Stop(ctx)
+
+	// Manually add entries and apply them
+	entries := []storage.LogEntry{
+		{Index: 1, Term: 1, Cmd: types.Command{Op: types.OpPut, Key: "k1", Value: "v1"}},
+		{Index: 2, Term: 1, Cmd: types.Command{Op: types.OpPut, Key: "k2", Value: "v2"}},
+		{Index: 3, Term: 2, Cmd: types.Command{Op: types.OpPut, Key: "k3", Value: "v3"}},
+		{Index: 4, Term: 2, Cmd: types.Command{Op: types.OpPut, Key: "k4", Value: "v4"}},
+		{Index: 5, Term: 3, Cmd: types.Command{Op: types.OpPut, Key: "k5", Value: "v5"}},
+	}
+	node.log.Append(entries)
+
+	// Apply all entries to state machine
+	for _, e := range entries {
+		sm.Apply(e.Cmd)
+	}
+
+	node.mu.Lock()
+	node.currentTerm = 3
+	node.lastApplied = 5
+	node.commitIndex = 5
+	node.mu.Unlock()
+
+	// Create snapshot at index 3
+	if err := node.CreateSnapshot(3); err != nil {
+		t.Fatalf("CreateSnapshot failed: %v", err)
+	}
+
+	// Verify snapshot state
+	node.mu.Lock()
+	lastSnapshotIndex := node.lastSnapshotIndex
+	lastSnapshotTerm := node.lastSnapshotTerm
+	node.mu.Unlock()
+
+	if lastSnapshotIndex != 3 {
+		t.Fatalf("expected lastSnapshotIndex=3, got %d", lastSnapshotIndex)
+	}
+	if lastSnapshotTerm != 2 {
+		t.Fatalf("expected lastSnapshotTerm=2, got %d", lastSnapshotTerm)
+	}
+
+	// Verify log was truncated
+	baseIndex := node.log.BaseIndex()
+	if baseIndex != 3 {
+		t.Fatalf("expected baseIndex=3, got %d", baseIndex)
+	}
+
+	// Verify snapshot was saved
+	meta, data, ok, err := node.snap.Load()
+	if err != nil || !ok {
+		t.Fatalf("snapshot not found: err=%v, ok=%v", err, ok)
+	}
+	if meta.LastIncludedIndex != 3 || meta.LastIncludedTerm != 2 {
+		t.Fatalf("wrong snapshot meta: %+v", meta)
+	}
+	if len(data) == 0 {
+		t.Fatal("snapshot data is empty")
+	}
+
+	// Verify we can still access entries 4 and 5
+	term, err := node.log.TermAt(4)
+	if err != nil {
+		t.Fatalf("TermAt(4) failed: %v", err)
+	}
+	if term != 2 {
+		t.Fatalf("expected term 2 at index 4, got %d", term)
+	}
+
+	lastIdx, _ := node.log.LastIndex()
+	if lastIdx != 5 {
+		t.Fatalf("expected lastIndex=5, got %d", lastIdx)
+	}
+}
+
+func TestRaft_M5_FollowerInstallSnapshot_RestoresState(t *testing.T) {
+	ctx := context.Background()
+	follower, sm := makeNode(t, "f1", nil, nil)
+	follower.Start(ctx)
+	defer follower.Stop(ctx)
+
+	// Create snapshot data with some state
+	snapshotState := kvsm.Snapshot{
+		KV:     map[string]string{"foo": "bar", "baz": "qux"},
+		Dedupe: map[string]kvsm.DedupeRecord{},
+	}
+	snapshotData, _ := json.Marshal(snapshotState)
+	encodedData := base64.StdEncoding.EncodeToString(snapshotData)
+
+	// Send InstallSnapshot RPC
+	req := transporthttp.InstallSnapshotRequest{
+		Term:              5,
+		LeaderID:          "leader",
+		LeaderAddr:        "http://leader:8080",
+		LastIncludedIndex: 100,
+		LastIncludedTerm:  4,
+		Data:              encodedData,
+	}
+
+	resp, err := follower.HandleInstallSnapshot(ctx, req)
+	if err != nil {
+		t.Fatalf("HandleInstallSnapshot failed: %v", err)
+	}
+	if resp.Term != 5 {
+		t.Fatalf("expected term 5, got %d", resp.Term)
+	}
+
+	// Verify state machine was restored
+	val, ok := sm.Get("foo")
+	if !ok || val != "bar" {
+		t.Fatalf("expected foo=bar, got %q ok=%v", val, ok)
+	}
+	val, ok = sm.Get("baz")
+	if !ok || val != "qux" {
+		t.Fatalf("expected baz=qux, got %q ok=%v", val, ok)
+	}
+
+	// Verify snapshot state was updated
+	follower.mu.Lock()
+	lastSnapshotIndex := follower.lastSnapshotIndex
+	lastApplied := follower.lastApplied
+	commitIndex := follower.commitIndex
+	follower.mu.Unlock()
+
+	if lastSnapshotIndex != 100 {
+		t.Fatalf("expected lastSnapshotIndex=100, got %d", lastSnapshotIndex)
+	}
+	if lastApplied != 100 {
+		t.Fatalf("expected lastApplied=100, got %d", lastApplied)
+	}
+	if commitIndex != 100 {
+		t.Fatalf("expected commitIndex=100, got %d", commitIndex)
+	}
+
+	// Verify log base was updated
+	baseIndex := follower.log.BaseIndex()
+	if baseIndex != 100 {
+		t.Fatalf("expected baseIndex=100, got %d", baseIndex)
+	}
+
+	// Verify leader hint was updated
+	hint := follower.LeaderHint()
+	if hint.LeaderID != "leader" {
+		t.Fatalf("expected leader hint, got %+v", hint)
+	}
+}
+
+func TestRaft_M5_MaybeSnapshot_TriggersAtThreshold(t *testing.T) {
+	ctx := context.Background()
+
+	// Create node with low threshold
+	sm := kvsm.New()
+	stable := storage.NewMemStableStore()
+	logStore := storage.NewMemLogStore()
+	snap := storage.NewMemSnapshotStore()
+	cfg := Config{
+		ID:                "n1",
+		Peers:             nil,
+		Addr:              "http://n1:8080",
+		Timing:            fastTiming(),
+		SnapshotThreshold: 3, // Low threshold for testing
+	}
+	node, err := NewNode(cfg, stable, logStore, snap, nil, sm)
+	if err != nil {
+		t.Fatal(err)
+	}
+	node.Start(ctx)
+	defer node.Stop(ctx)
+
+	// Add entries and apply them
+	entries := []storage.LogEntry{
+		{Index: 1, Term: 1, Cmd: types.Command{Op: types.OpPut, Key: "k1", Value: "v1"}},
+		{Index: 2, Term: 1, Cmd: types.Command{Op: types.OpPut, Key: "k2", Value: "v2"}},
+		{Index: 3, Term: 1, Cmd: types.Command{Op: types.OpPut, Key: "k3", Value: "v3"}},
+		{Index: 4, Term: 1, Cmd: types.Command{Op: types.OpPut, Key: "k4", Value: "v4"}},
+	}
+	logStore.Append(entries)
+	for _, e := range entries {
+		sm.Apply(e.Cmd)
+	}
+
+	node.mu.Lock()
+	node.lastApplied = 4
+	node.commitIndex = 4
+	node.mu.Unlock()
+
+	// MaybeSnapshot should trigger since lastApplied - lastSnapshotIndex >= threshold
+	if err := node.MaybeSnapshot(); err != nil {
+		t.Fatalf("MaybeSnapshot failed: %v", err)
+	}
+
+	// Verify snapshot was created
+	node.mu.Lock()
+	lastSnapshotIndex := node.lastSnapshotIndex
+	node.mu.Unlock()
+
+	if lastSnapshotIndex != 4 {
+		t.Fatalf("expected lastSnapshotIndex=4, got %d", lastSnapshotIndex)
+	}
+}
+
+func TestCluster_M5_LaggingFollowerCatchesUpViaSnapshot(t *testing.T) {
+	ctx := context.Background()
+	ids := []types.NodeID{"n1", "n2"}
+
+	servers := make([]*httptest.Server, 2)
+	nodes := make([]*Node, 2)
+	sms := make([]*kvsm.KVStateMachine, 2)
+
+	// Create servers first
+	for i := range servers {
+		mux := http.NewServeMux()
+		servers[i] = httptest.NewServer(mux)
+	}
+	defer func() {
+		for _, s := range servers {
+			if s != nil {
+				s.Close()
+			}
+		}
+	}()
+
+	peerMap := make(map[types.NodeID]string)
+	for i, id := range ids {
+		peerMap[id] = servers[i].URL
+	}
+
+	// Create n1 (leader) with entries and snapshot
+	{
+		peers := []types.NodeID{"n2"}
+		resolver := transporthttp.NewPeerResolver(peerMap)
+		tp := transporthttp.NewHTTPTransport(resolver)
+
+		sm := kvsm.New()
+		stable := storage.NewMemStableStore()
+		logStore := storage.NewMemLogStore()
+		snapStore := storage.NewMemSnapshotStore()
+
+		// Pre-populate with entries 1-5
+		entries := []storage.LogEntry{
+			{Index: 1, Term: 1, Cmd: types.Command{Op: types.OpPut, Key: "a", Value: "1"}},
+			{Index: 2, Term: 1, Cmd: types.Command{Op: types.OpPut, Key: "b", Value: "2"}},
+			{Index: 3, Term: 1, Cmd: types.Command{Op: types.OpPut, Key: "c", Value: "3"}},
+			{Index: 4, Term: 2, Cmd: types.Command{Op: types.OpPut, Key: "d", Value: "4"}},
+			{Index: 5, Term: 2, Cmd: types.Command{Op: types.OpPut, Key: "e", Value: "5"}},
+		}
+		logStore.Append(entries)
+		for _, e := range entries {
+			sm.Apply(e.Cmd)
+		}
+		stable.SetCurrentTerm(2)
+
+		// Create snapshot at index 3
+		snapshotData, _ := sm.Snapshot()
+		snapStore.Save(storage.SnapshotMeta{LastIncludedIndex: 3, LastIncludedTerm: 1}, snapshotData)
+		logStore.TruncatePrefix(3)
+
+		cfg := Config{
+			ID:     "n1",
+			Peers:  peers,
+			Addr:   servers[0].URL,
+			Timing: fastTiming(),
+		}
+		var err error
+		nodes[0], err = NewNode(cfg, stable, logStore, snapStore, tp, sm)
+		if err != nil {
+			t.Fatal(err)
+		}
+		// Update snapshot state
+		nodes[0].mu.Lock()
+		nodes[0].lastSnapshotIndex = 3
+		nodes[0].lastSnapshotTerm = 1
+		nodes[0].lastApplied = 5
+		nodes[0].commitIndex = 5
+		nodes[0].mu.Unlock()
+
+		sms[0] = sm
+		servers[0].Config.Handler = nodes[0].RaftHTTPHandler().Handler()
+	}
+
+	// Create n2 (follower) with empty log - lagging behind
+	{
+		peers := []types.NodeID{"n1"}
+		resolver := transporthttp.NewPeerResolver(peerMap)
+		tp := transporthttp.NewHTTPTransport(resolver)
+
+		sm := kvsm.New()
+		stable := storage.NewMemStableStore()
+		logStore := storage.NewMemLogStore()
+		snapStore := storage.NewMemSnapshotStore()
+
+		cfg := Config{
+			ID:     "n2",
+			Peers:  peers,
+			Addr:   servers[1].URL,
+			Timing: fastTiming(),
+		}
+		var err error
+		nodes[1], err = NewNode(cfg, stable, logStore, snapStore, tp, sm)
+		if err != nil {
+			t.Fatal(err)
+		}
+		sms[1] = sm
+		servers[1].Config.Handler = nodes[1].RaftHTTPHandler().Handler()
+	}
+
+	// Start both nodes
+	for _, n := range nodes {
+		n.Start(ctx)
+	}
+	defer func() {
+		for _, n := range nodes {
+			n.Stop(ctx)
+		}
+	}()
+
+	// Force n1 to be leader
+	nodes[0].mu.Lock()
+	nodes[0].role = RoleLeader
+	nodes[0].currentTerm = 2
+	nodes[0].nextIndex["n2"] = 1 // Follower is at index 0
+	nodes[0].matchIndex["n2"] = 0
+	nodes[0].mu.Unlock()
+
+	// Replicate to peer - should send snapshot since nextIndex <= baseIndex
+	success, matchIdx := nodes[0].replicateToPeer(ctx, "n2")
+
+	if !success {
+		t.Fatal("replication via snapshot should succeed")
+	}
+	if matchIdx != 3 {
+		t.Fatalf("expected matchIdx=3 (snapshot index), got %d", matchIdx)
+	}
+
+	// Verify follower received the snapshot
+	time.Sleep(50 * time.Millisecond) // Allow state machine to be restored
+
+	val, ok := sms[1].Get("a")
+	if !ok || val != "1" {
+		t.Fatalf("follower missing key a: got %q ok=%v", val, ok)
+	}
+	val, ok = sms[1].Get("b")
+	if !ok || val != "2" {
+		t.Fatalf("follower missing key b: got %q ok=%v", val, ok)
+	}
+	val, ok = sms[1].Get("c")
+	if !ok || val != "3" {
+		t.Fatalf("follower missing key c: got %q ok=%v", val, ok)
+	}
+
+	// Verify follower's state was updated
+	nodes[1].mu.Lock()
+	lastSnapshotIndex := nodes[1].lastSnapshotIndex
+	lastApplied := nodes[1].lastApplied
+	nodes[1].mu.Unlock()
+
+	if lastSnapshotIndex != 3 {
+		t.Fatalf("expected follower lastSnapshotIndex=3, got %d", lastSnapshotIndex)
+	}
+	if lastApplied != 3 {
+		t.Fatalf("expected follower lastApplied=3, got %d", lastApplied)
 	}
 }
