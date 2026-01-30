@@ -42,18 +42,34 @@ type RequestVoteResponse struct {
 	VoteGranted bool   `json:"vote_granted"`
 }
 
+// M5: InstallSnapshot RPC DTOs
+type InstallSnapshotRequest struct {
+	Term              uint64       `json:"term"`
+	LeaderID          types.NodeID `json:"leader_id"`
+	LeaderAddr        string       `json:"leader_addr"`
+	LastIncludedIndex uint64       `json:"last_included_index"`
+	LastIncludedTerm  uint64       `json:"last_included_term"`
+	Data              string       `json:"data"` // Base64-encoded snapshot
+}
+
+type InstallSnapshotResponse struct {
+	Term uint64 `json:"term"`
+}
+
 // --- Interfaces ---
 
 // RaftRPCHandler is implemented by the Raft node to handle incoming RPCs.
 type RaftRPCHandler interface {
 	HandleAppendEntries(ctx context.Context, req AppendEntriesRequest) (AppendEntriesResponse, error)
 	HandleRequestVote(ctx context.Context, req RequestVoteRequest) (RequestVoteResponse, error)
+	HandleInstallSnapshot(ctx context.Context, req InstallSnapshotRequest) (InstallSnapshotResponse, error) // M5
 }
 
 // Transport is the interface the Raft node uses to send RPCs.
 type Transport interface {
 	AppendEntries(ctx context.Context, to types.NodeID, req AppendEntriesRequest) (AppendEntriesResponse, error)
 	RequestVote(ctx context.Context, to types.NodeID, req RequestVoteRequest) (RequestVoteResponse, error)
+	InstallSnapshot(ctx context.Context, to types.NodeID, req InstallSnapshotRequest) (InstallSnapshotResponse, error) // M5
 }
 
 // --- PeerResolver ---
@@ -157,6 +173,41 @@ func (t *HTTPTransport) RequestVote(ctx context.Context, to types.NodeID, req Re
 	return result, nil
 }
 
+// M5: InstallSnapshot sends a snapshot to a peer.
+func (t *HTTPTransport) InstallSnapshot(ctx context.Context, to types.NodeID, req InstallSnapshotRequest) (InstallSnapshotResponse, error) {
+	addr, err := t.resolver.Resolve(to)
+	if err != nil {
+		return InstallSnapshotResponse{}, err
+	}
+
+	body, err := json.Marshal(req)
+	if err != nil {
+		return InstallSnapshotResponse{}, err
+	}
+
+	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, addr+"/raft/install_snapshot", bytes.NewReader(body))
+	if err != nil {
+		return InstallSnapshotResponse{}, err
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+
+	resp, err := t.client.Do(httpReq)
+	if err != nil {
+		return InstallSnapshotResponse{}, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return InstallSnapshotResponse{}, fmt.Errorf("install_snapshot to %s returned %d", to, resp.StatusCode)
+	}
+
+	var result InstallSnapshotResponse
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return InstallSnapshotResponse{}, err
+	}
+	return result, nil
+}
+
 // --- RaftHTTPServer (server mux) ---
 
 type RaftHTTPServer struct {
@@ -171,6 +222,7 @@ func (s *RaftHTTPServer) Handler() http.Handler {
 	mux := http.NewServeMux()
 	mux.HandleFunc("POST /raft/append_entries", s.handleAppendEntries)
 	mux.HandleFunc("POST /raft/request_vote", s.handleRequestVote)
+	mux.HandleFunc("POST /raft/install_snapshot", s.handleInstallSnapshot) // M5
 	return mux
 }
 
@@ -205,6 +257,28 @@ func (s *RaftHTTPServer) handleRequestVote(w http.ResponseWriter, r *http.Reques
 	}
 
 	resp, err := s.handler.HandleRequestVote(r.Context(), req)
+	if err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusInternalServerError)
+		json.NewEncoder(w).Encode(map[string]string{"error": err.Error()})
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(resp)
+}
+
+// M5: handleInstallSnapshot handles incoming InstallSnapshot RPCs.
+func (s *RaftHTTPServer) handleInstallSnapshot(w http.ResponseWriter, r *http.Request) {
+	var req InstallSnapshotRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusBadRequest)
+		json.NewEncoder(w).Encode(map[string]string{"error": "bad JSON"})
+		return
+	}
+
+	resp, err := s.handler.HandleInstallSnapshot(r.Context(), req)
 	if err != nil {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusInternalServerError)

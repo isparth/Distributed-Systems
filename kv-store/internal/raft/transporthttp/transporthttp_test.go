@@ -14,8 +14,10 @@ import (
 type mockHandler struct {
 	lastAEReq  AppendEntriesRequest
 	lastRVReq  RequestVoteRequest
+	lastISReq  InstallSnapshotRequest
 	aeRespTerm uint64
 	rvRespTerm uint64
+	isRespTerm uint64
 	voteGrant  bool
 }
 
@@ -27,6 +29,12 @@ func (m *mockHandler) HandleAppendEntries(_ context.Context, req AppendEntriesRe
 func (m *mockHandler) HandleRequestVote(_ context.Context, req RequestVoteRequest) (RequestVoteResponse, error) {
 	m.lastRVReq = req
 	return RequestVoteResponse{Term: m.rvRespTerm, VoteGranted: m.voteGrant}, nil
+}
+
+// M5: HandleInstallSnapshot for mock handler
+func (m *mockHandler) HandleInstallSnapshot(_ context.Context, req InstallSnapshotRequest) (InstallSnapshotResponse, error) {
+	m.lastISReq = req
+	return InstallSnapshotResponse{Term: m.isRespTerm}, nil
 }
 
 func TestTransportHTTP_AppendEntries_RoundTrip(t *testing.T) {
@@ -119,5 +127,54 @@ func TestTransportHTTP_RequestVote_RoundTrip(t *testing.T) {
 	}
 	if handler.lastRVReq.LastLogIndex != 10 || handler.lastRVReq.LastLogTerm != 4 {
 		t.Fatalf("request mismatch: %+v", handler.lastRVReq)
+	}
+}
+
+// --- M5 Tests ---
+
+func TestTransportHTTP_InstallSnapshot_Base64RoundTrip(t *testing.T) {
+	handler := &mockHandler{isRespTerm: 7}
+	raftSrv := NewRaftHTTPServer(handler)
+	ts := httptest.NewServer(raftSrv.Handler())
+	defer ts.Close()
+
+	resolver := NewPeerResolver(map[types.NodeID]string{
+		"node2": ts.URL,
+	})
+	transport := NewHTTPTransport(resolver)
+
+	// Create a base64-encoded snapshot
+	// snapshotData would be: `{"kv":{"foo":"bar","baz":"qux"},"dedupe":{}}`
+	encodedData := "eyJrdiI6eyJmb28iOiJiYXIiLCJiYXoiOiJxdXgifSwiZGVkdXBlIjp7fX0=" // base64 of snapshotData
+
+	req := InstallSnapshotRequest{
+		Term:              7,
+		LeaderID:          "node1",
+		LeaderAddr:        "http://localhost:8080",
+		LastIncludedIndex: 100,
+		LastIncludedTerm:  6,
+		Data:              encodedData,
+	}
+
+	resp, err := transport.InstallSnapshot(context.Background(), "node2", req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resp.Term != 7 {
+		t.Fatalf("expected term 7, got %d", resp.Term)
+	}
+
+	// Verify the request was received correctly
+	if handler.lastISReq.LeaderID != "node1" {
+		t.Fatalf("expected leader node1, got %s", handler.lastISReq.LeaderID)
+	}
+	if handler.lastISReq.LastIncludedIndex != 100 {
+		t.Fatalf("expected last included index 100, got %d", handler.lastISReq.LastIncludedIndex)
+	}
+	if handler.lastISReq.LastIncludedTerm != 6 {
+		t.Fatalf("expected last included term 6, got %d", handler.lastISReq.LastIncludedTerm)
+	}
+	if handler.lastISReq.Data != encodedData {
+		t.Fatalf("data mismatch: got %s", handler.lastISReq.Data)
 	}
 }
