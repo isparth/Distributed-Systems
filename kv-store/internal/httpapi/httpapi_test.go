@@ -40,6 +40,14 @@ func (m *mockNode) Status() types.NodeStatus {
 	}
 }
 
+func (m *mockNode) GetReadIndex(_ context.Context) (uint64, error) {
+	return 0, nil
+}
+
+func (m *mockNode) WaitApplied(_ context.Context, index uint64) error {
+	return nil
+}
+
 func setupLeader() *httptest.Server {
 	sm := kvsm.New()
 	node := &mockNode{leader: true, sm: sm}

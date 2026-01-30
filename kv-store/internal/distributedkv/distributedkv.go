@@ -13,6 +13,9 @@ type RaftNodeIface interface {
 	IsLeader() bool
 	LeaderHint() types.LeaderHint
 	Status() types.NodeStatus
+	// M4: ReadIndex reads
+	GetReadIndex(ctx context.Context) (uint64, error)
+	WaitApplied(ctx context.Context, index uint64) error
 }
 
 // Config configures the DistributedKV layer.
@@ -50,14 +53,58 @@ func (d *DistributedKV) All() map[string]string {
 	return d.sm.All()
 }
 
-// --- Reads (stale, from local SM) ---
+// --- Reads ---
 
-func (d *DistributedKV) Get(key string) (string, bool) {
+// Get retrieves a value. Behavior depends on ReadPolicy:
+// - ReadPolicyStale: Returns immediately from local state machine (may be stale)
+// - ReadPolicyReadIndex: Confirms leadership and waits for commit index to be applied (consistent)
+func (d *DistributedKV) Get(ctx context.Context, key string) (string, bool, error) {
+	if d.cfg.ReadPolicy == types.ReadPolicyReadIndex {
+		if err := d.waitForReadIndex(ctx); err != nil {
+			return "", false, err
+		}
+	}
+	val, ok := d.sm.Get(key)
+	return val, ok, nil
+}
+
+// MGet retrieves multiple values. Behavior depends on ReadPolicy.
+func (d *DistributedKV) MGet(ctx context.Context, keys []string) (map[string]string, error) {
+	if d.cfg.ReadPolicy == types.ReadPolicyReadIndex {
+		if err := d.waitForReadIndex(ctx); err != nil {
+			return nil, err
+		}
+	}
+	return d.sm.MGet(keys), nil
+}
+
+// GetStale always reads from local state machine (ignores ReadPolicy).
+func (d *DistributedKV) GetStale(key string) (string, bool) {
 	return d.sm.Get(key)
 }
 
-func (d *DistributedKV) MGet(keys []string) map[string]string {
+// MGetStale always reads from local state machine (ignores ReadPolicy).
+func (d *DistributedKV) MGetStale(keys []string) map[string]string {
 	return d.sm.MGet(keys)
+}
+
+// waitForReadIndex gets the read index from leader and waits for it to be applied.
+func (d *DistributedKV) waitForReadIndex(ctx context.Context) error {
+	readIndex, err := d.node.GetReadIndex(ctx)
+	if err != nil {
+		return err
+	}
+	return d.node.WaitApplied(ctx, readIndex)
+}
+
+// SetReadPolicy changes the read policy at runtime.
+func (d *DistributedKV) SetReadPolicy(policy types.ReadPolicy) {
+	d.cfg.ReadPolicy = policy
+}
+
+// GetReadPolicy returns the current read policy.
+func (d *DistributedKV) GetReadPolicy() types.ReadPolicy {
+	return d.cfg.ReadPolicy
 }
 
 // --- Writes (sync, through Raft) ---

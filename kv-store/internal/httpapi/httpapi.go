@@ -50,7 +50,12 @@ func (s *Server) ListKeys(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) GetKey(w http.ResponseWriter, r *http.Request) {
 	key := chi.URLParam(r, "key")
-	v, ok := s.dkv.Get(key)
+	v, ok, err := s.dkv.Get(r.Context(), key)
+	if err != nil {
+		// ReadIndex failed - likely not leader or timeout
+		writeError(w, http.StatusServiceUnavailable, "read_index_failed", err.Error())
+		return
+	}
 	if !ok {
 		writeError(w, http.StatusNotFound, "not_found", "key not found")
 		return
@@ -125,7 +130,11 @@ func (s *Server) MGet(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "bad_request", "keys is required")
 		return
 	}
-	vals := s.dkv.MGet(body.Keys)
+	vals, err := s.dkv.MGet(r.Context(), body.Keys)
+	if err != nil {
+		writeError(w, http.StatusServiceUnavailable, "read_index_failed", err.Error())
+		return
+	}
 	writeJSON(w, http.StatusOK, map[string]interface{}{"ok": true, "values": vals})
 }
 
