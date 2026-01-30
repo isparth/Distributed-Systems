@@ -38,6 +38,8 @@ type LogStore interface {
 	ReadRange(lo, hi uint64) ([]LogEntry, error)
 	DeleteFrom(index uint64) error
 	TruncatePrefix(upto uint64) error
+	BaseIndex() uint64 // M5: returns the index of the last truncated entry (0 if none)
+	BaseTerm() uint64  // M5: returns the term at base index (0 if none)
 }
 
 // SnapshotStore persists snapshots.
@@ -88,9 +90,13 @@ func (s *MemStableStore) SetVotedFor(id types.NodeID) error {
 }
 
 // MemLogStore is an in-memory LogStore. Index 0 is a dummy sentinel.
+// After TruncatePrefix, baseIndex is the logical index of the last truncated entry
+// and baseTerm is the term at that index.
 type MemLogStore struct {
-	mu      sync.Mutex
-	entries []LogEntry // entries[0] is sentinel
+	mu        sync.Mutex
+	entries   []LogEntry // entries[0] is sentinel or first entry after truncation
+	baseIndex uint64     // M5: logical index of last truncated entry (0 initially)
+	baseTerm  uint64     // M5: term at baseIndex (0 initially)
 }
 
 func NewMemLogStore() *MemLogStore {
@@ -102,12 +108,38 @@ func NewMemLogStore() *MemLogStore {
 func (s *MemLogStore) LastIndex() (uint64, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return uint64(len(s.entries) - 1), nil
+	// M5: logical index = baseIndex + physical length - 1
+	// If baseIndex=0, entries[0] is sentinel, so lastIndex = len-1
+	// If baseIndex>0, entries[0] is first entry after truncation (at baseIndex+1),
+	// so lastIndex = baseIndex + len(entries)
+	if s.baseIndex == 0 {
+		return uint64(len(s.entries) - 1), nil
+	}
+	return s.baseIndex + uint64(len(s.entries)), nil
 }
 
 func (s *MemLogStore) TermAt(index uint64) (uint64, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
+	// M5: Handle baseIndex for truncated logs
+	if s.baseIndex > 0 {
+		// After truncation, baseIndex is the last truncated index
+		if index < s.baseIndex {
+			return 0, fmt.Errorf("index %d is before baseIndex %d (truncated)", index, s.baseIndex)
+		}
+		if index == s.baseIndex {
+			return s.baseTerm, nil
+		}
+		// Physical index: entries[0] is at logical index baseIndex+1
+		physIdx := index - s.baseIndex - 1
+		if physIdx >= uint64(len(s.entries)) {
+			return 0, fmt.Errorf("index %d out of range [%d, %d]", index, s.baseIndex, s.baseIndex+uint64(len(s.entries)))
+		}
+		return s.entries[physIdx].Term, nil
+	}
+
+	// No truncation case (baseIndex == 0)
 	if index == 0 || int(index) >= len(s.entries) {
 		return 0, fmt.Errorf("index %d out of range [1, %d]", index, len(s.entries)-1)
 	}
@@ -117,19 +149,38 @@ func (s *MemLogStore) TermAt(index uint64) (uint64, error) {
 func (s *MemLogStore) Append(entries []LogEntry) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	for _, e := range entries {
-		s.entries = append(s.entries, e)
-	}
+	s.entries = append(s.entries, entries...)
 	return nil
 }
 
 func (s *MemLogStore) ReadRange(lo, hi uint64) ([]LogEntry, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
+	// M5: Handle baseIndex for truncated logs
+	if s.baseIndex > 0 {
+		// Minimum accessible index is baseIndex+1
+		if lo <= s.baseIndex || hi <= s.baseIndex {
+			return nil, fmt.Errorf("invalid range [%d, %d]: indices must be > baseIndex %d", lo, hi, s.baseIndex)
+		}
+		if lo > hi {
+			return nil, fmt.Errorf("invalid range [%d, %d]: lo > hi", lo, hi)
+		}
+		// Physical indices
+		physLo := lo - s.baseIndex - 1
+		physHi := hi - s.baseIndex - 1
+		if physHi >= uint64(len(s.entries)) {
+			return nil, fmt.Errorf("invalid range [%d, %d]: hi beyond log end %d", lo, hi, s.baseIndex+uint64(len(s.entries)))
+		}
+		result := make([]LogEntry, physHi-physLo+1)
+		copy(result, s.entries[physLo:physHi+1])
+		return result, nil
+	}
+
+	// No truncation case
 	if lo < 1 || hi >= uint64(len(s.entries)) || lo > hi {
 		return nil, fmt.Errorf("invalid range [%d, %d], log length %d", lo, hi, len(s.entries)-1)
 	}
-	// Return a copy
 	result := make([]LogEntry, hi-lo+1)
 	copy(result, s.entries[lo:hi+1])
 	return result, nil
@@ -138,6 +189,22 @@ func (s *MemLogStore) ReadRange(lo, hi uint64) ([]LogEntry, error) {
 func (s *MemLogStore) DeleteFrom(index uint64) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+
+	// M5: Handle baseIndex for truncated logs
+	if s.baseIndex > 0 {
+		if index <= s.baseIndex {
+			return fmt.Errorf("index %d out of range: must be > baseIndex %d", index, s.baseIndex)
+		}
+		// Physical index
+		physIdx := index - s.baseIndex - 1
+		if physIdx >= uint64(len(s.entries)) {
+			return fmt.Errorf("index %d out of range [%d, %d]", index, s.baseIndex+1, s.baseIndex+uint64(len(s.entries)))
+		}
+		s.entries = s.entries[:physIdx]
+		return nil
+	}
+
+	// No truncation case
 	if index < 1 || int(index) >= len(s.entries) {
 		return fmt.Errorf("index %d out of range [1, %d]", index, len(s.entries)-1)
 	}
@@ -146,8 +213,67 @@ func (s *MemLogStore) DeleteFrom(index uint64) error {
 }
 
 func (s *MemLogStore) TruncatePrefix(upto uint64) error {
-	// No-op until M5
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if upto == 0 {
+		return nil // nothing to truncate
+	}
+
+	// Get the term at the truncation point before modifying
+	var termAtUpto uint64
+	if s.baseIndex > 0 {
+		// Already have a base
+		if upto < s.baseIndex {
+			return nil // already truncated past this point
+		}
+		if upto == s.baseIndex {
+			return nil // already at this base
+		}
+		// upto > baseIndex
+		physIdx := upto - s.baseIndex - 1
+		if physIdx >= uint64(len(s.entries)) {
+			return fmt.Errorf("cannot truncate to index %d: beyond log end %d", upto, s.baseIndex+uint64(len(s.entries)))
+		}
+		termAtUpto = s.entries[physIdx].Term
+		// Keep entries from upto+1 onwards
+		s.entries = s.entries[physIdx+1:]
+	} else {
+		// No prior truncation (baseIndex == 0)
+		if upto >= uint64(len(s.entries)) {
+			return fmt.Errorf("cannot truncate to index %d: beyond log end %d", upto, len(s.entries)-1)
+		}
+		termAtUpto = s.entries[upto].Term
+		// Keep entries from upto+1 onwards
+		s.entries = s.entries[upto+1:]
+	}
+
+	s.baseIndex = upto
+	s.baseTerm = termAtUpto
 	return nil
+}
+
+// BaseIndex returns the index of the last truncated entry (0 if no truncation).
+func (s *MemLogStore) BaseIndex() uint64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.baseIndex
+}
+
+// BaseTerm returns the term at the base index (0 if no truncation).
+func (s *MemLogStore) BaseTerm() uint64 {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.baseTerm
+}
+
+// SetBase sets the base index and term directly (used when restoring from snapshot).
+func (s *MemLogStore) SetBase(index, term uint64) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.baseIndex = index
+	s.baseTerm = term
+	s.entries = nil // Clear any existing entries
 }
 
 // MemSnapshotStore is an in-memory SnapshotStore.

@@ -224,3 +224,178 @@ func TestMemStableStore_TermVote(t *testing.T) {
 		t.Fatalf("expected vote for node1, got %s hasVote=%v", id, hasVote)
 	}
 }
+
+// --- M5 Tests ---
+
+func TestLogStore_TruncatePrefix(t *testing.T) {
+	s := NewMemLogStore()
+
+	// Add entries 1-5
+	entries := []LogEntry{
+		{Index: 1, Term: 1, Cmd: types.Command{Op: types.OpPut, Key: "a", Value: "1"}},
+		{Index: 2, Term: 1, Cmd: types.Command{Op: types.OpPut, Key: "b", Value: "2"}},
+		{Index: 3, Term: 2, Cmd: types.Command{Op: types.OpPut, Key: "c", Value: "3"}},
+		{Index: 4, Term: 2, Cmd: types.Command{Op: types.OpPut, Key: "d", Value: "4"}},
+		{Index: 5, Term: 3, Cmd: types.Command{Op: types.OpPut, Key: "e", Value: "5"}},
+	}
+	s.Append(entries)
+
+	// Verify initial state
+	lastIdx, _ := s.LastIndex()
+	if lastIdx != 5 {
+		t.Fatalf("expected last index 5, got %d", lastIdx)
+	}
+
+	// Truncate prefix up to index 3
+	if err := s.TruncatePrefix(3); err != nil {
+		t.Fatalf("TruncatePrefix failed: %v", err)
+	}
+
+	// Verify base index and term
+	if s.BaseIndex() != 3 {
+		t.Fatalf("expected base index 3, got %d", s.BaseIndex())
+	}
+	if s.BaseTerm() != 2 {
+		t.Fatalf("expected base term 2, got %d", s.BaseTerm())
+	}
+
+	// Verify last index is still 5
+	lastIdx, _ = s.LastIndex()
+	if lastIdx != 5 {
+		t.Fatalf("expected last index 5 after truncate, got %d", lastIdx)
+	}
+
+	// Verify can get term at baseIndex
+	term, err := s.TermAt(3)
+	if err != nil {
+		t.Fatalf("TermAt(3) failed: %v", err)
+	}
+	if term != 2 {
+		t.Fatalf("expected term 2 at index 3, got %d", term)
+	}
+
+	// Verify can read entries 4 and 5
+	got, err := s.ReadRange(4, 5)
+	if err != nil {
+		t.Fatalf("ReadRange(4, 5) failed: %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("expected 2 entries, got %d", len(got))
+	}
+	if got[0].Cmd.Key != "d" || got[1].Cmd.Key != "e" {
+		t.Fatalf("wrong entries: %+v", got)
+	}
+
+	// Verify cannot read truncated entries
+	_, err = s.ReadRange(1, 2)
+	if err == nil {
+		t.Fatal("expected error reading truncated entries")
+	}
+
+	// Verify can append new entries after truncation
+	newEntries := []LogEntry{
+		{Index: 6, Term: 3, Cmd: types.Command{Op: types.OpPut, Key: "f", Value: "6"}},
+	}
+	if err := s.Append(newEntries); err != nil {
+		t.Fatalf("Append after truncate failed: %v", err)
+	}
+
+	lastIdx, _ = s.LastIndex()
+	if lastIdx != 6 {
+		t.Fatalf("expected last index 6 after append, got %d", lastIdx)
+	}
+
+	// Verify DeleteFrom works after truncation
+	if err := s.DeleteFrom(5); err != nil {
+		t.Fatalf("DeleteFrom(5) failed: %v", err)
+	}
+	lastIdx, _ = s.LastIndex()
+	if lastIdx != 4 {
+		t.Fatalf("expected last index 4 after delete, got %d", lastIdx)
+	}
+}
+
+func TestLogStore_SetBase(t *testing.T) {
+	s := NewMemLogStore()
+
+	// SetBase to simulate snapshot restore
+	s.SetBase(10, 5)
+
+	if s.BaseIndex() != 10 {
+		t.Fatalf("expected base index 10, got %d", s.BaseIndex())
+	}
+	if s.BaseTerm() != 5 {
+		t.Fatalf("expected base term 5, got %d", s.BaseTerm())
+	}
+
+	// Last index should be baseIndex (no entries after base)
+	lastIdx, _ := s.LastIndex()
+	if lastIdx != 10 {
+		t.Fatalf("expected last index 10, got %d", lastIdx)
+	}
+
+	// TermAt baseIndex should return baseTerm
+	term, err := s.TermAt(10)
+	if err != nil {
+		t.Fatalf("TermAt(10) failed: %v", err)
+	}
+	if term != 5 {
+		t.Fatalf("expected term 5, got %d", term)
+	}
+
+	// Append new entries
+	entries := []LogEntry{
+		{Index: 11, Term: 5, Cmd: types.Command{Op: types.OpPut, Key: "a", Value: "1"}},
+		{Index: 12, Term: 6, Cmd: types.Command{Op: types.OpPut, Key: "b", Value: "2"}},
+	}
+	s.Append(entries)
+
+	lastIdx, _ = s.LastIndex()
+	if lastIdx != 12 {
+		t.Fatalf("expected last index 12, got %d", lastIdx)
+	}
+
+	// Read the new entries
+	got, err := s.ReadRange(11, 12)
+	if err != nil {
+		t.Fatalf("ReadRange failed: %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("expected 2 entries, got %d", len(got))
+	}
+}
+
+func TestSnapshotStore_SaveLoad(t *testing.T) {
+	s := NewMemSnapshotStore()
+
+	// Initially no snapshot
+	_, _, ok, err := s.Load()
+	if err != nil {
+		t.Fatalf("Load failed: %v", err)
+	}
+	if ok {
+		t.Fatal("expected no snapshot initially")
+	}
+
+	// Save a snapshot
+	meta := SnapshotMeta{LastIncludedIndex: 100, LastIncludedTerm: 5}
+	data := []byte(`{"kv":{"foo":"bar"},"dedupe":{}}`)
+	if err := s.Save(meta, data); err != nil {
+		t.Fatalf("Save failed: %v", err)
+	}
+
+	// Load the snapshot
+	loadedMeta, loadedData, ok, err := s.Load()
+	if err != nil {
+		t.Fatalf("Load failed: %v", err)
+	}
+	if !ok {
+		t.Fatal("expected snapshot to be present")
+	}
+	if loadedMeta.LastIncludedIndex != 100 || loadedMeta.LastIncludedTerm != 5 {
+		t.Fatalf("wrong meta: %+v", loadedMeta)
+	}
+	if string(loadedData) != string(data) {
+		t.Fatalf("wrong data: %s", loadedData)
+	}
+}
