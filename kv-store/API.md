@@ -145,7 +145,7 @@ Returns detailed node state for debugging and monitoring.
 GET /kv/{key}
 ```
 
-Retrieves value for a single key from local state machine (may be stale).
+Retrieves value for a single key. Behavior depends on the configured read policy.
 
 **Path Parameters**:
 - `key`: Key name (URL-encoded)
@@ -167,13 +167,26 @@ Retrieves value for a single key from local state machine (may be stale).
 }
 ```
 
-**Status**: 200 OK (success), 404 (not found)
+**Response** (ReadIndex failed - M4):
+```json
+{
+  "ok": false,
+  "err_code": "read_index_failed",
+  "err_msg": "not leader"
+}
+```
+
+**Status**: 200 OK (success), 404 (not found), 503 (read index failed)
+
+**Read Policies (M4)**:
+- **Stale (default)**: Returns immediately from local state machine. Fast but may be stale.
+- **ReadIndex**: Confirms leadership via quorum, waits for commit index to be applied, then reads. Linearizable but slower.
 
 **Notes**:
-- Returns stale data (may lag behind leader)
-- Fast; no Raft replication required
-- Safe for read-heavy workloads
-- Use /status to check if this node is leader if you need fresh data
+- With stale policy: Returns potentially stale data (may lag behind leader)
+- With ReadIndex policy: Returns fresh data but requires leader and quorum check
+- Fast for stale reads; no Raft replication required
+- Safe for read-heavy workloads with stale policy
 
 **Example**:
 ```bash
@@ -188,7 +201,7 @@ curl http://localhost:8080/kv/username
 POST /kv/mget
 ```
 
-Retrieves values for multiple keys in a single operation.
+Retrieves values for multiple keys in a single operation. Behavior depends on read policy.
 
 **Request Body**:
 ```json
@@ -209,11 +222,21 @@ Retrieves values for multiple keys in a single operation.
 }
 ```
 
-**Status**: 200 OK
+**Response** (ReadIndex failed - M4):
+```json
+{
+  "ok": false,
+  "err_code": "read_index_failed",
+  "err_msg": "not leader"
+}
+```
+
+**Status**: 200 OK, 503 (read index failed with ReadIndex policy)
 
 **Notes**:
 - Missing keys are omitted from response
-- Stale read (local state machine)
+- With stale policy: Reads from local state machine (fast, potentially stale)
+- With ReadIndex policy: Confirms leadership, waits for apply, then reads (consistent)
 - Atomic from local state machine perspective
 
 **Example**:
@@ -734,4 +757,4 @@ curl -X PUT $LEADER/kv/key \
 
 ---
 
-**Last Updated**: Milestone 3 (Log Correctness)
+**Last Updated**: Milestone 4 (ReadIndex Reads)

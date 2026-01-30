@@ -4,7 +4,7 @@ A production-oriented implementation of a distributed key-value store using the 
 
 ## Current Status
 
-**Milestone 3: Log Correctness** ✅ Complete
+**Milestone 4: ReadIndex Reads** ✅ Complete
 
 The system supports:
 - Distributed replication across multiple nodes
@@ -12,6 +12,7 @@ The system supports:
 - Log consistency with conflict detection and repair
 - Deterministic state machine with deduplication
 - HTTP API for client operations
+- Configurable read policies (stale vs consistent ReadIndex reads)
 
 ## Architecture
 
@@ -74,10 +75,11 @@ KV State Machine    Log Storage (in-memory)   HTTP Transport
 - Committed entries safety (current-term-only commit rule)
 - Storage layer validation (DeleteFrom, TermAt error handling)
 
-### 🔮 Milestone 4: ReadIndex Reads (Planned)
+### ✅ Milestone 4: ReadIndex Reads
 - Configurable read policies (stale vs. consistent)
-- ReadIndex quorum-based consistent reads
-- Applied index wait logic
+- ReadIndex quorum-based consistent reads with leadership confirmation
+- WaitApplied blocking until index is applied to state machine
+- Runtime-switchable read policy via SetReadPolicy()
 
 ### 🔮 Milestone 5: Snapshots & Compaction (Planned)
 - Log snapshots for bounded storage
@@ -251,8 +253,24 @@ All components are thread-safe:
 - HTTP transport only: No TLS, no authentication
 - Single-threaded apply: Could batch for higher throughput
 - No member change: Cluster membership is static
-- Stale reads only: Consistent reads planned for M4
+
+## Read Policies (M4)
+
+The system supports two read policies:
+
+| Policy | Consistency | Latency | Use Case |
+|--------|-------------|---------|----------|
+| **Stale** (default) | Eventually consistent | Fast (local read) | Read-heavy workloads, caching |
+| **ReadIndex** | Linearizable | Slower (quorum check) | Financial transactions, critical reads |
+
+### How ReadIndex Works
+
+1. Client calls `Get()` with `ReadPolicyReadIndex` configured
+2. Leader confirms leadership via heartbeat quorum (majority response)
+3. Leader returns its current `commitIndex` as the read index
+4. Client waits until `lastApplied >= readIndex`
+5. Read is served from local state machine (guaranteed fresh)
 
 ---
 
-**Last Updated**: Milestone 3 (Log Correctness)
+**Last Updated**: Milestone 4 (ReadIndex Reads)
